@@ -5,7 +5,6 @@
 //! - Automatic contiguous copy when needed for GEMM
 //! - Generic over algebra and backend
 
-mod dense;
 mod ops;
 mod view;
 
@@ -15,7 +14,6 @@ use crate::algebra::{Algebra, Scalar};
 use crate::backend::{Backend, Storage};
 
 pub(crate) use ops::BinaryContractOptions;
-pub use dense::DenseTensor;
 pub use view::TensorView;
 
 /// A multi-dimensional tensor with stride-based layout.

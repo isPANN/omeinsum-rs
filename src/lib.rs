@@ -71,7 +71,7 @@ pub(crate) mod test_support;
 pub use algebra::{Algebra, CloneSemiring, Complex32, Complex64, Semiring, Standard};
 pub use backend::{Backend, BackendScalar, Cpu, Storage};
 pub use einsum::{cost_and_gradient, einsum, einsum_with_grad, EinBuilder, Einsum};
-pub use tensor::{DenseTensor, Tensor, TensorView};
+pub use tensor::{Tensor, TensorView};
 
 #[cfg(feature = "tropical")]
 pub use algebra::{MaxMul, MaxPlus, MinPlus};
