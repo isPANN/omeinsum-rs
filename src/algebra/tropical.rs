@@ -4,7 +4,7 @@
 //! - [`MinPlus<T>`]: `(min, +)` semiring for shortest path
 //! - [`MaxMul<T>`]: `(max, ×)` semiring for max probability
 
-use super::semiring::{Algebra, CloneSemiring, Semiring};
+use super::semiring::{Algebra, GenericSemiring, Semiring};
 use super::Scalar;
 use num_traits::{Bounded, One, Zero};
 
@@ -25,7 +25,7 @@ use num_traits::{Bounded, One, Zero};
 /// # Example
 ///
 /// ```rust
-/// use omeinsum::algebra::{MaxPlus, CloneSemiring, Semiring};
+/// use omeinsum::algebra::{MaxPlus, GenericSemiring, Semiring};
 ///
 /// let a = MaxPlus(2.0f32);
 /// let b = MaxPlus(3.0f32);
@@ -37,7 +37,7 @@ use num_traits::{Bounded, One, Zero};
 #[repr(transparent)]
 pub struct MaxPlus<T: Scalar>(pub T);
 
-impl<T> CloneSemiring for MaxPlus<T>
+impl<T> GenericSemiring for MaxPlus<T>
 where
     T: Scalar + Bounded + Zero + PartialOrd + std::ops::Add<Output = T>,
 {
@@ -165,7 +165,7 @@ where
 #[repr(transparent)]
 pub struct MinPlus<T: Scalar>(pub T);
 
-impl<T> CloneSemiring for MinPlus<T>
+impl<T> GenericSemiring for MinPlus<T>
 where
     T: Scalar + Bounded + Zero + PartialOrd + std::ops::Add<Output = T>,
 {
@@ -290,7 +290,7 @@ where
 #[repr(transparent)]
 pub struct MaxMul<T: Scalar>(pub T);
 
-impl<T> CloneSemiring for MaxMul<T>
+impl<T> GenericSemiring for MaxMul<T>
 where
     T: Scalar + Zero + One + PartialOrd + std::ops::Mul<Output = T>,
 {

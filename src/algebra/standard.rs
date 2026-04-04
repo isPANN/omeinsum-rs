@@ -1,6 +1,6 @@
 //! Standard arithmetic semiring `(+, ×)`.
 
-use super::semiring::{Algebra, CloneSemiring, Semiring};
+use super::semiring::{Algebra, GenericSemiring, Semiring};
 use super::Scalar;
 use num_traits::{One, Zero};
 
@@ -11,7 +11,7 @@ use num_traits::{One, Zero};
 /// # Example
 ///
 /// ```rust
-/// use omeinsum::algebra::{Standard, CloneSemiring, Semiring};
+/// use omeinsum::algebra::{Standard, GenericSemiring, Semiring};
 ///
 /// let a = Standard(2.0f32);
 /// let b = Standard(3.0f32);
@@ -25,7 +25,7 @@ pub struct Standard<T: Scalar>(pub T);
 
 impl<
         T: Scalar + Zero + One + PartialEq + std::ops::Add<Output = T> + std::ops::Mul<Output = T>,
-    > CloneSemiring for Standard<T>
+    > GenericSemiring for Standard<T>
 {
     #[inline]
     fn zero() -> Self {

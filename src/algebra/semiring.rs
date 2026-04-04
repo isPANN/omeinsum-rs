@@ -20,7 +20,7 @@ use super::Scalar;
 /// | MaxPlus  | max | + | -∞ | 0 |
 /// | MinPlus  | min | + | +∞ | 0 |
 /// | MaxMul   | max | × | 0 | 1 |
-pub trait CloneSemiring: Clone + Send + Sync + 'static {
+pub trait GenericSemiring: Clone + Send + Sync + 'static {
     /// Additive identity (zero element for ⊕)
     fn zero() -> Self;
     /// Multiplicative identity (one element for ⊗)
@@ -35,8 +35,8 @@ pub trait CloneSemiring: Clone + Send + Sync + 'static {
 
 /// Copy semiring with scalar conversion. Enables GEMM optimization.
 ///
-/// Extends [`CloneSemiring`] with `Copy` and scalar bridging for BLAS backends.
-pub trait Semiring: CloneSemiring + Copy {
+/// Extends [`GenericSemiring`] with `Copy` and scalar bridging for BLAS backends.
+pub trait Semiring: GenericSemiring + Copy {
     /// The underlying scalar type
     type Scalar: Scalar;
     /// Create from scalar value
