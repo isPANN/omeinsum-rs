@@ -512,18 +512,18 @@ impl Einsum<usize> {
 }
 
 // =========================================================================
-// CloneSemiring support: contraction for non-Copy semiring types.
+// GenericSemiring support: contraction for non-Copy semiring types.
 // =========================================================================
 
 impl Einsum<usize> {
-    /// Execute the einsum contraction for [`CloneSemiring`] types via generic loops.
+    /// Execute the einsum contraction for [`GenericSemiring`] types via generic loops.
     ///
     /// Each tensor is a `(data, shape)` pair with data in column-major order.
     /// Returns the contracted result as `(data, shape)`.
     ///
     /// This is the non-Copy counterpart to [`execute`]. Use this for semiring
     /// types that carry heap allocations (e.g. `ConfigEnumerator`).
-    pub fn execute_generic<S: crate::algebra::CloneSemiring>(
+    pub fn execute_generic<S: crate::algebra::GenericSemiring>(
         &self,
         tensors: &[(Vec<S>, Vec<usize>)],
     ) -> (Vec<S>, Vec<usize>) {
@@ -546,7 +546,7 @@ impl Einsum<usize> {
     }
 
     #[allow(clippy::only_used_in_recursion)]
-    fn execute_tree_generic<S: crate::algebra::CloneSemiring>(
+    fn execute_tree_generic<S: crate::algebra::GenericSemiring>(
         &self,
         tree: &NestedEinsum<usize>,
         tensors: &[(Vec<S>, Vec<usize>)],
@@ -568,7 +568,7 @@ impl Einsum<usize> {
         }
     }
 
-    fn execute_pairwise_generic<S: crate::algebra::CloneSemiring>(
+    fn execute_pairwise_generic<S: crate::algebra::GenericSemiring>(
         &self,
         tensors: &[(Vec<S>, Vec<usize>)],
     ) -> (Vec<S>, Vec<usize>) {
@@ -599,8 +599,8 @@ impl Einsum<usize> {
     }
 }
 
-/// Pairwise contraction for `CloneSemiring` types via generic loops.
-fn contract_generic<S: crate::algebra::CloneSemiring>(
+/// Pairwise contraction for `GenericSemiring` types via generic loops.
+fn contract_generic<S: crate::algebra::GenericSemiring>(
     a_data: &[S], a_shape: &[usize], modes_a: &[usize],
     b_data: &[S], b_shape: &[usize], modes_b: &[usize],
     modes_c: &[usize],
@@ -655,8 +655,8 @@ fn contract_generic<S: crate::algebra::CloneSemiring>(
     (result, c_shape)
 }
 
-/// Unary reduction for `CloneSemiring`: sum (⊕) over modes not in the output.
-fn reduce_generic<S: crate::algebra::CloneSemiring>(
+/// Unary reduction for `GenericSemiring`: sum (⊕) over modes not in the output.
+fn reduce_generic<S: crate::algebra::GenericSemiring>(
     data: &[S], shape: &[usize], modes_in: &[usize], modes_out: &[usize],
 ) -> (Vec<S>, Vec<usize>) {
     if modes_in == modes_out {
@@ -898,7 +898,7 @@ mod cross_path_tests {
         let data_a = vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0];
         let data_b = vec![7.0f64, 8.0, 9.0, 10.0, 11.0, 12.0];
 
-        // Generic (CloneSemiring) path
+        // Generic (GenericSemiring) path
         let clone_a: Vec<Standard<f64>> = data_a.iter().map(|&x| Standard(x)).collect();
         let clone_b: Vec<Standard<f64>> = data_b.iter().map(|&x| Standard(x)).collect();
         let tensors_clone = vec![
@@ -1938,12 +1938,12 @@ mod tests {
 #[cfg(test)]
 mod execute_generic_tests {
     use super::*;
-    use crate::algebra::CloneSemiring;
+    use crate::algebra::GenericSemiring;
 
     #[derive(Clone, Debug, PartialEq)]
     struct SumSemiring(f64);
 
-    impl CloneSemiring for SumSemiring {
+    impl GenericSemiring for SumSemiring {
         fn zero() -> Self { SumSemiring(0.0) }
         fn one() -> Self { SumSemiring(1.0) }
         fn add(self, rhs: Self) -> Self { SumSemiring(self.0 + rhs.0) }
