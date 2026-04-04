@@ -12,7 +12,7 @@ mod standard;
 #[cfg(feature = "tropical")]
 mod tropical;
 
-pub use semiring::{Algebra, CloneSemiring, Semiring};
+pub use semiring::{Algebra, GenericSemiring, Semiring};
 pub use standard::Standard;
 
 #[cfg(feature = "tropical")]
