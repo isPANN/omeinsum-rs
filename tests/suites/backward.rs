@@ -128,6 +128,38 @@ fn test_backward_matmul_ones() {
     assert_eq!(grads[1].to_vec(), vec![3.0, 7.0, 3.0, 7.0]);
 }
 
+#[test]
+fn test_backward_three_tensor_scalar_cycle_standard() {
+    // A, B, C are diagonal matrices:
+    // A = diag(2, 3), B = diag(5, 7), C = diag(11, 13)
+    // einsum "ij,jk,ki->" = sum_i A[i,i] * B[i,i] * C[i,i]
+    // = 2*5*11 + 3*7*13 = 383
+    let a = Tensor::<f64, Cpu>::from_data(&[2.0, 0.0, 0.0, 3.0], &[2, 2]);
+    let b = Tensor::<f64, Cpu>::from_data(&[5.0, 0.0, 0.0, 7.0], &[2, 2]);
+    let c = Tensor::<f64, Cpu>::from_data(&[11.0, 0.0, 0.0, 13.0], &[2, 2]);
+
+    let (result, grad_fn) =
+        einsum_with_grad::<Standard<f64>, _, _>(&[&a, &b, &c], &[&[0, 1], &[1, 2], &[2, 0]], &[]);
+
+    assert_eq!(result.shape(), &[] as &[usize]);
+    assert_eq!(result.to_vec(), vec![383.0]);
+
+    let grad_out = Tensor::<f64, Cpu>::from_data(&[1.0], &[]);
+    let grads = grad_fn.backward::<Standard<f64>>(&grad_out, &[&a, &b, &c]);
+
+    assert_eq!(grads.len(), 3);
+    assert_eq!(grads[0].shape(), &[2, 2]);
+    assert_eq!(grads[1].shape(), &[2, 2]);
+    assert_eq!(grads[2].shape(), &[2, 2]);
+
+    // d/dA = diag(B .* C) = diag(55, 91)
+    assert_eq!(grads[0].to_vec(), vec![55.0, 0.0, 0.0, 91.0]);
+    // d/dB = diag(A .* C) = diag(22, 39)
+    assert_eq!(grads[1].to_vec(), vec![22.0, 0.0, 0.0, 39.0]);
+    // d/dC = diag(A .* B) = diag(10, 21)
+    assert_eq!(grads[2].to_vec(), vec![10.0, 0.0, 0.0, 21.0]);
+}
+
 // ============================================================================
 // Tropical algebra backward tests (require tropical feature)
 // ============================================================================
@@ -289,10 +321,10 @@ fn test_backward_large_values_f64() {
 
     // Verify result is computed correctly
     assert_eq!(result.shape(), &[2, 2]);
-    
+
     let grad_out = Tensor::<f64, Cpu>::from_data(&[1.0, 1.0, 1.0, 1.0], &[2, 2]);
     let grads = grad_fn.backward::<Standard<f64>>(&grad_out, &[&a, &b]);
-    
+
     assert_eq!(grads[0].shape(), &[2, 2]);
     assert_eq!(grads[1].shape(), &[2, 2]);
 }
@@ -358,15 +390,15 @@ fn test_backward_complex64_nontrivial() {
     // Test with non-trivial complex numbers and gradients
     let a = Tensor::<Complex64, Cpu>::from_data(
         &[
-            Complex64::new(1.0, 1.0),   // 1+i
-            Complex64::new(2.0, -1.0),  // 2-i
+            Complex64::new(1.0, 1.0),  // 1+i
+            Complex64::new(2.0, -1.0), // 2-i
         ],
         &[2, 1],
     );
     let b = Tensor::<Complex64, Cpu>::from_data(
         &[
-            Complex64::new(1.0, 0.0),   // 1
-            Complex64::new(0.0, 1.0),   // i
+            Complex64::new(1.0, 0.0), // 1
+            Complex64::new(0.0, 1.0), // i
         ],
         &[1, 2],
     );
@@ -409,25 +441,21 @@ fn test_backward_complex64_trace() {
     // Test trace gradient with complex numbers: ii->
     let a = Tensor::<Complex64, Cpu>::from_data(
         &[
-            Complex64::new(1.0, 1.0),   // A[0,0] = 1+i
-            Complex64::new(2.0, -1.0),  // A[1,0] = 2-i
-            Complex64::new(3.0, 0.5),   // A[0,1] = 3+0.5i
-            Complex64::new(4.0, -0.5),  // A[1,1] = 4-0.5i
+            Complex64::new(1.0, 1.0),  // A[0,0] = 1+i
+            Complex64::new(2.0, -1.0), // A[1,0] = 2-i
+            Complex64::new(3.0, 0.5),  // A[0,1] = 3+0.5i
+            Complex64::new(4.0, -0.5), // A[1,1] = 4-0.5i
         ],
         &[2, 2],
     );
 
-    let (result, grad_fn) =
-        einsum_with_grad::<Standard<Complex64>, _, _>(&[&a], &[&[0, 0]], &[]);
+    let (result, grad_fn) = einsum_with_grad::<Standard<Complex64>, _, _>(&[&a], &[&[0, 0]], &[]);
 
     // Trace = A[0,0] + A[1,1] = (1+i) + (4-0.5i) = 5 + 0.5i
     let result_vec = result.to_vec();
     assert!((result_vec[0] - Complex64::new(5.0, 0.5)).norm() < 1e-10);
 
-    let grad_out = Tensor::<Complex64, Cpu>::from_data(
-        &[Complex64::new(1.0, 0.0)],
-        &[],
-    );
+    let grad_out = Tensor::<Complex64, Cpu>::from_data(&[Complex64::new(1.0, 0.0)], &[]);
     let grads = grad_fn.backward::<Standard<Complex64>>(&grad_out, &[&a]);
 
     // Gradient of trace is identity matrix
@@ -453,17 +481,13 @@ fn test_backward_complex64_sum() {
         &[2, 2],
     );
 
-    let (result, grad_fn) =
-        einsum_with_grad::<Standard<Complex64>, _, _>(&[&a], &[&[0, 1]], &[]);
+    let (result, grad_fn) = einsum_with_grad::<Standard<Complex64>, _, _>(&[&a], &[&[0, 1]], &[]);
 
     // Sum = (1+i) + (2-i) + (3+0.5i) + (4-0.5i) = 10 + 0i
     let result_vec = result.to_vec();
     assert!((result_vec[0] - Complex64::new(10.0, 0.0)).norm() < 1e-10);
 
-    let grad_out = Tensor::<Complex64, Cpu>::from_data(
-        &[Complex64::new(1.0, 0.0)],
-        &[],
-    );
+    let grad_out = Tensor::<Complex64, Cpu>::from_data(&[Complex64::new(1.0, 0.0)], &[]);
     let grads = grad_fn.backward::<Standard<Complex64>>(&grad_out, &[&a]);
 
     // Gradient of sum is all ones
@@ -588,26 +612,30 @@ fn test_backward_all_matmul_transposes() {
     let b = Tensor::<f64, Cpu>::from_data(&[5.0, 6.0, 7.0, 8.0], &[2, 2]);
 
     // ij,jk->ik (standard)
-    let (_, grad_fn1) = einsum_with_grad::<Standard<f64>, _, _>(&[&a, &b], &[&[0, 1], &[1, 2]], &[0, 2]);
+    let (_, grad_fn1) =
+        einsum_with_grad::<Standard<f64>, _, _>(&[&a, &b], &[&[0, 1], &[1, 2]], &[0, 2]);
     let grad_out = Tensor::<f64, Cpu>::from_data(&[1.0; 4], &[2, 2]);
     let grads1 = grad_fn1.backward::<Standard<f64>>(&grad_out, &[&a, &b]);
     assert_eq!(grads1[0].shape(), &[2, 2]);
     assert_eq!(grads1[1].shape(), &[2, 2]);
 
     // ij,kj->ik (B transposed)
-    let (_, grad_fn2) = einsum_with_grad::<Standard<f64>, _, _>(&[&a, &b], &[&[0, 1], &[2, 1]], &[0, 2]);
+    let (_, grad_fn2) =
+        einsum_with_grad::<Standard<f64>, _, _>(&[&a, &b], &[&[0, 1], &[2, 1]], &[0, 2]);
     let grads2 = grad_fn2.backward::<Standard<f64>>(&grad_out, &[&a, &b]);
     assert_eq!(grads2[0].shape(), &[2, 2]);
     assert_eq!(grads2[1].shape(), &[2, 2]);
 
     // ji,jk->ik (A transposed)
-    let (_, grad_fn3) = einsum_with_grad::<Standard<f64>, _, _>(&[&a, &b], &[&[1, 0], &[1, 2]], &[0, 2]);
+    let (_, grad_fn3) =
+        einsum_with_grad::<Standard<f64>, _, _>(&[&a, &b], &[&[1, 0], &[1, 2]], &[0, 2]);
     let grads3 = grad_fn3.backward::<Standard<f64>>(&grad_out, &[&a, &b]);
     assert_eq!(grads3[0].shape(), &[2, 2]);
     assert_eq!(grads3[1].shape(), &[2, 2]);
 
     // ji,kj->ik (both transposed)
-    let (_, grad_fn4) = einsum_with_grad::<Standard<f64>, _, _>(&[&a, &b], &[&[1, 0], &[2, 1]], &[0, 2]);
+    let (_, grad_fn4) =
+        einsum_with_grad::<Standard<f64>, _, _>(&[&a, &b], &[&[1, 0], &[2, 1]], &[0, 2]);
     let grads4 = grad_fn4.backward::<Standard<f64>>(&grad_out, &[&a, &b]);
     assert_eq!(grads4[0].shape(), &[2, 2]);
     assert_eq!(grads4[1].shape(), &[2, 2]);
@@ -621,10 +649,12 @@ fn test_backward_3tensor_chain() {
     let c = Tensor::<f64, Cpu>::from_data(&[2.0, 0.0, 0.0, 2.0], &[2, 2]);
 
     // First: A @ B
-    let (ab, grad_fn_ab) = einsum_with_grad::<Standard<f64>, _, _>(&[&a, &b], &[&[0, 1], &[1, 2]], &[0, 2]);
+    let (ab, grad_fn_ab) =
+        einsum_with_grad::<Standard<f64>, _, _>(&[&a, &b], &[&[0, 1], &[1, 2]], &[0, 2]);
 
     // Second: (A @ B) @ C
-    let (result, grad_fn_abc) = einsum_with_grad::<Standard<f64>, _, _>(&[&ab, &c], &[&[0, 1], &[1, 2]], &[0, 2]);
+    let (result, grad_fn_abc) =
+        einsum_with_grad::<Standard<f64>, _, _>(&[&ab, &c], &[&[0, 1], &[1, 2]], &[0, 2]);
 
     assert_eq!(result.shape(), &[2, 2]);
 

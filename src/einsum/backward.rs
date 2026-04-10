@@ -18,7 +18,9 @@ use crate::backend::{Backend, BackendScalar, Storage};
 use crate::tensor::Tensor;
 use std::collections::HashMap;
 
-use super::engine::execute_unary_naive;
+use super::engine::{
+    compute_normalized_binary_indices, execute_unary_naive, execute_unary_with_argmax,
+};
 
 /// Compute gradient for a unary einsum operation.
 ///
@@ -43,7 +45,7 @@ pub fn contract_unary_backward<A, T, B>(
 where
     A: Algebra<Scalar = T, Index = u32>,
     T: Scalar,
-    B: Backend + Default,
+    B: Backend,
 {
     // The elegant insight: gradient is just einsum with swapped indices!
     // Forward: y = einsum(ix -> iy, x)
@@ -72,7 +74,7 @@ pub fn tropical_unary_backward<T, B>(
 ) -> Tensor<T, B>
 where
     T: Scalar,
-    B: Backend + Default,
+    B: Backend,
 {
     // Create zero tensor with input shape (Scalar requires Default which gives 0 for numerics)
     let input_size: usize = input_shape.iter().product();
@@ -90,7 +92,7 @@ where
         grad_data[winner_pos as usize] += grad_val;
     }
 
-    Tensor::from_data(&grad_data, input_shape)
+    Tensor::from_data_with_backend(&grad_data, input_shape, grad_y.backend().clone())
 }
 
 /// Compute gradients for a binary contraction.
@@ -277,217 +279,335 @@ where
 }
 
 // ============================================================================
-// CacheTree and cost_and_gradient implementation
+// Executed-tape gradient implementation
 // ============================================================================
-//
-// Port of Julia OMEinsum's bp.jl for computing gradients efficiently.
-// The key insight is to cache intermediate contraction results during forward
-// pass and reuse them during backward pass.
 
 use omeco::NestedEinsum;
 
 use crate::einsum::Einsum;
 
-/// Cache tree for storing intermediate contraction results.
-///
-/// Isomorphic to the contraction tree structure from `NestedEinsum`.
-/// Each node stores the tensor computed at that step, plus optional
-/// argmax for tropical algebras.
-///
-/// # Example
-///
-/// For a contraction `(A @ B) @ C`:
-/// ```text
-/// CacheTree {
-///     content: result of (A @ B) @ C
-///     argmax: Some(...) if tropical
-///     siblings: [
-///         CacheTree { content: result of A @ B, siblings: [A_cache, B_cache] },
-///         CacheTree { content: C, siblings: [] }
-///     ]
-/// }
-/// ```
-pub struct CacheTree<T: Scalar, B: Backend> {
-    /// The cached tensor result at this node
-    pub content: Tensor<T, B>,
-    /// Argmax tensor for tropical algebras (optional)
-    pub argmax: Option<Tensor<u32, B>>,
-    /// Child cache trees (called "siblings" in Julia for tree siblings)
-    pub siblings: Vec<CacheTree<T, B>>,
+#[derive(Clone)]
+enum TapeOp {
+    Leaf {
+        tensor_index: usize,
+    },
+    Unary {
+        input_ix: Vec<usize>,
+        output_ix: Vec<usize>,
+    },
+    Binary {
+        left_ix: Vec<usize>,
+        right_ix: Vec<usize>,
+        output_ix: Vec<usize>,
+    },
 }
 
-impl<T: Scalar, B: Backend> CacheTree<T, B> {
-    /// Create a leaf cache (for input tensors).
-    pub fn leaf(tensor: Tensor<T, B>) -> Self {
-        CacheTree {
+#[derive(Clone)]
+struct TapeNode<T: Scalar, B: Backend> {
+    content: Tensor<T, B>,
+    argmax: Option<Tensor<u32, B>>,
+    op: TapeOp,
+    children: Vec<TapeNode<T, B>>,
+}
+
+impl<T: Scalar, B: Backend> TapeNode<T, B> {
+    fn leaf(tensor_index: usize, tensor: Tensor<T, B>) -> Self {
+        Self {
             content: tensor,
             argmax: None,
-            siblings: Vec::new(),
+            op: TapeOp::Leaf { tensor_index },
+            children: Vec::new(),
         }
     }
 
-    /// Create an internal node cache.
-    pub fn node(content: Tensor<T, B>, argmax: Option<Tensor<u32, B>>, siblings: Vec<Self>) -> Self {
-        CacheTree {
+    fn unary(
+        input_ix: Vec<usize>,
+        output_ix: Vec<usize>,
+        content: Tensor<T, B>,
+        argmax: Option<Tensor<u32, B>>,
+        child: Self,
+    ) -> Self {
+        Self {
             content,
             argmax,
-            siblings,
+            op: TapeOp::Unary {
+                input_ix,
+                output_ix,
+            },
+            children: vec![child],
+        }
+    }
+
+    fn binary(
+        left_ix: Vec<usize>,
+        right_ix: Vec<usize>,
+        output_ix: Vec<usize>,
+        content: Tensor<T, B>,
+        argmax: Option<Tensor<u32, B>>,
+        left: Self,
+        right: Self,
+    ) -> Self {
+        Self {
+            content,
+            argmax,
+            op: TapeOp::Binary {
+                left_ix,
+                right_ix,
+                output_ix,
+            },
+            children: vec![left, right],
         }
     }
 }
 
-/// Compute einsum with caching for backward pass.
-///
-/// Recursively contracts tensors following the contraction tree,
-/// caching intermediate results for gradient computation.
-///
-/// # Arguments
-///
-/// * `code` - The contraction tree from optimization
-/// * `tensors` - Input tensors
-/// * `size_dict` - Dimension sizes
-///
-/// # Returns
-///
-/// CacheTree containing all intermediate results.
-#[allow(clippy::only_used_in_recursion)]
-pub fn cached_einsum<A, T, B>(
-    code: &NestedEinsum<usize>,
+#[derive(Clone)]
+pub(crate) struct GradientTape<T: Scalar, B: Backend> {
+    root: TapeNode<T, B>,
+    size_dict: HashMap<usize, usize>,
+    input_shapes: Vec<Vec<usize>>,
+}
+
+impl<T: Scalar, B: Backend> GradientTape<T, B> {
+    pub(crate) fn result(&self) -> Tensor<T, B> {
+        self.root.content.clone()
+    }
+
+    pub(crate) fn num_inputs(&self) -> usize {
+        self.input_shapes.len()
+    }
+
+    pub(crate) fn input_shapes(&self) -> &[Vec<usize>] {
+        &self.input_shapes
+    }
+
+    pub(crate) fn backward<A>(&self, dy: &Tensor<T, B>) -> Vec<Tensor<T, B>>
+    where
+        A: Algebra<Scalar = T, Index = u32>,
+        T: BackendScalar<B>,
+    {
+        let mut grads: Vec<Option<Tensor<T, B>>> = vec![None; self.input_shapes.len()];
+        backprop_tape_node::<A, T, B>(&self.root, dy, &self.size_dict, &mut grads);
+        grads.into_iter().map(|grad| grad.unwrap()).collect()
+    }
+}
+
+pub(crate) fn build_gradient_tape<A, T, B>(
+    code: &Einsum<usize>,
     tensors: &[&Tensor<T, B>],
-    size_dict: &HashMap<usize, usize>,
-) -> CacheTree<T, B>
+) -> GradientTape<T, B>
 where
     A: Algebra<Scalar = T, Index = u32>,
     T: Scalar + BackendScalar<B>,
-    B: Backend + Default,
+    B: Backend,
 {
-    match code {
-        NestedEinsum::Leaf { tensor_index } => {
-            // For leaf nodes, just cache the input tensor
-            CacheTree::leaf(tensors[*tensor_index].clone())
-        }
-        NestedEinsum::Node { args, eins } => {
-            // Recursively cache children
-            let children: Vec<CacheTree<T, B>> = args
-                .iter()
-                .map(|arg| cached_einsum::<A, T, B>(arg, tensors, size_dict))
-                .collect();
+    let tree = code
+        .contraction_tree()
+        .expect("build_gradient_tape requires optimized Einsum. Call optimize_greedy() first.");
+    let (root, root_ix) = build_tape_node_from_tree::<A, T, B>(tree, code, tensors);
+    let root = finalize_tape_node::<A, T, B>(root, &root_ix, &code.iy, &code.size_dict);
 
-            // Contract the children's results
+    GradientTape {
+        root,
+        size_dict: code.size_dict.clone(),
+        input_shapes: tensors
+            .iter()
+            .map(|tensor| tensor.shape().to_vec())
+            .collect(),
+    }
+}
+
+#[allow(clippy::only_used_in_recursion)]
+fn build_tape_node_from_tree<A, T, B>(
+    tree: &NestedEinsum<usize>,
+    code: &Einsum<usize>,
+    tensors: &[&Tensor<T, B>],
+) -> (TapeNode<T, B>, Vec<usize>)
+where
+    A: Algebra<Scalar = T, Index = u32>,
+    T: Scalar + BackendScalar<B>,
+    B: Backend,
+{
+    match tree {
+        NestedEinsum::Leaf { tensor_index } => (
+            TapeNode::leaf(*tensor_index, tensors[*tensor_index].clone()),
+            code.ixs[*tensor_index].clone(),
+        ),
+        NestedEinsum::Node { args, eins } => {
             assert_eq!(args.len(), 2, "Expected binary contraction tree");
 
-            let left = &children[0].content;
-            let right = &children[1].content;
-            let ia = &eins.ixs[0];
-            let ib = &eins.ixs[1];
-            let iy = &eins.iy;
+            let (left, left_ix) = build_tape_node_from_tree::<A, T, B>(&args[0], code, tensors);
+            let (right, right_ix) = build_tape_node_from_tree::<A, T, B>(&args[1], code, tensors);
 
-            let (result, argmax) = if A::needs_argmax() {
-                let (r, am) = left.contract_binary_with_argmax::<A>(right, ia, ib, iy);
-                (r, Some(am))
+            let (left, left_ix) = normalize_tape_operand::<A, T, B>(
+                left,
+                &left_ix,
+                &right_ix,
+                &eins.iy,
+                &code.size_dict,
+            );
+            let (right, right_ix) = normalize_tape_operand::<A, T, B>(
+                right,
+                &right_ix,
+                &left_ix,
+                &eins.iy,
+                &code.size_dict,
+            );
+
+            let (content, argmax) = if A::needs_argmax() {
+                let (content, argmax) = left.content.contract_binary_with_argmax::<A>(
+                    &right.content,
+                    &left_ix,
+                    &right_ix,
+                    &eins.iy,
+                );
+                (content, Some(argmax))
             } else {
-                (left.contract_binary::<A>(right, ia, ib, iy), None)
+                (
+                    left.content.contract_binary::<A>(
+                        &right.content,
+                        &left_ix,
+                        &right_ix,
+                        &eins.iy,
+                    ),
+                    None,
+                )
             };
 
-            CacheTree::node(result, argmax, children)
+            (
+                TapeNode::binary(
+                    left_ix,
+                    right_ix,
+                    eins.iy.clone(),
+                    content,
+                    argmax,
+                    left,
+                    right,
+                ),
+                eins.iy.clone(),
+            )
         }
     }
 }
 
-/// Back-propagate gradients through the cache tree.
-///
-/// Given a gradient on the output, propagates it backward through the tree,
-/// computing gradients for all intermediate nodes.
-///
-/// # Arguments
-///
-/// * `code` - The contraction tree
-/// * `cache` - Cached forward results
-/// * `dy` - Gradient on the output
-/// * `size_dict` - Dimension sizes
-///
-/// # Returns
-///
-/// CacheTree where each node's `content` is the gradient at that position.
-#[allow(clippy::only_used_in_recursion)]
-pub fn back_propagate<A, T, B>(
-    code: &NestedEinsum<usize>,
-    cache: &CacheTree<T, B>,
-    dy: &Tensor<T, B>,
+fn normalize_tape_operand<A, T, B>(
+    node: TapeNode<T, B>,
+    ix: &[usize],
+    other: &[usize],
+    output: &[usize],
     size_dict: &HashMap<usize, usize>,
-) -> CacheTree<T, B>
+) -> (TapeNode<T, B>, Vec<usize>)
 where
     A: Algebra<Scalar = T, Index = u32>,
     T: Scalar + BackendScalar<B>,
-    B: Backend + Default,
+    B: Backend,
 {
-    match code {
-        NestedEinsum::Leaf { .. } => {
-            // For leaves, the gradient is just dy
-            CacheTree::leaf(dy.clone())
-        }
-        NestedEinsum::Node { args, eins } => {
-            assert_eq!(args.len(), 2, "Expected binary contraction tree");
-
-            // Get cached forward values
-            let left = &cache.siblings[0].content;
-            let right = &cache.siblings[1].content;
-            let argmax = cache.argmax.as_ref();
-
-            let ia = &eins.ixs[0];
-            let ib = &eins.ixs[1];
-            let iy = &eins.iy;
-
-            // Compute gradients for left and right children
-            let (grad_left, grad_right) =
-                contract_binary_backward::<A, T, B>(dy, left, right, argmax, ia, ib, iy);
-
-            // Recursively back-propagate through children
-            let child_grads: Vec<CacheTree<T, B>> = vec![
-                back_propagate::<A, T, B>(&args[0], &cache.siblings[0], &grad_left, size_dict),
-                back_propagate::<A, T, B>(&args[1], &cache.siblings[1], &grad_right, size_dict),
-            ];
-
-            CacheTree::node(dy.clone(), None, child_grads)
-        }
+    let normalized_ix = compute_normalized_binary_indices(ix, other, output);
+    if normalized_ix == ix {
+        (node, normalized_ix)
+    } else {
+        let (content, argmax) = if A::needs_argmax() {
+            let (content, argmax) =
+                execute_unary_with_argmax::<A, T, B>(&node.content, ix, &normalized_ix, size_dict);
+            (content, Some(argmax))
+        } else {
+            (
+                execute_unary_naive::<A, T, B>(&node.content, ix, &normalized_ix, size_dict),
+                None,
+            )
+        };
+        (
+            TapeNode::unary(ix.to_vec(), normalized_ix.clone(), content, argmax, node),
+            normalized_ix,
+        )
     }
 }
 
-/// Extract gradients from leaf nodes of a gradient tree.
-///
-/// # Arguments
-///
-/// * `code` - The contraction tree
-/// * `grad_tree` - The gradient tree from back_propagate
-/// * `num_inputs` - Total number of input tensors; used to pre-allocate the
-///   result vector and index gradients by their original tensor positions.
-///
-/// # Returns
-///
-/// Vector of gradients, one per input tensor in original order.
-pub fn extract_leaves<T: Scalar, B: Backend>(
-    code: &NestedEinsum<usize>,
-    grad_tree: &CacheTree<T, B>,
-    num_inputs: usize,
-) -> Vec<Tensor<T, B>> {
-    let mut result: Vec<Option<Tensor<T, B>>> = vec![None; num_inputs];
-    extract_leaves_impl(code, grad_tree, &mut result);
-    result.into_iter().map(|opt| opt.unwrap()).collect()
+fn finalize_tape_node<A, T, B>(
+    node: TapeNode<T, B>,
+    current_ix: &[usize],
+    expected_ix: &[usize],
+    size_dict: &HashMap<usize, usize>,
+) -> TapeNode<T, B>
+where
+    A: Algebra<Scalar = T, Index = u32>,
+    T: Scalar + BackendScalar<B>,
+    B: Backend,
+{
+    if current_ix == expected_ix {
+        node
+    } else {
+        let (content, argmax) = if A::needs_argmax() {
+            let (content, argmax) = execute_unary_with_argmax::<A, T, B>(
+                &node.content,
+                current_ix,
+                expected_ix,
+                size_dict,
+            );
+            (content, Some(argmax))
+        } else {
+            (
+                execute_unary_naive::<A, T, B>(&node.content, current_ix, expected_ix, size_dict),
+                None,
+            )
+        };
+        TapeNode::unary(
+            current_ix.to_vec(),
+            expected_ix.to_vec(),
+            content,
+            argmax,
+            node,
+        )
+    }
 }
 
-fn extract_leaves_impl<T: Scalar, B: Backend>(
-    code: &NestedEinsum<usize>,
-    grad_tree: &CacheTree<T, B>,
-    result: &mut [Option<Tensor<T, B>>],
-) {
-    match code {
-        NestedEinsum::Leaf { tensor_index } => {
-            result[*tensor_index] = Some(grad_tree.content.clone());
+fn backprop_tape_node<A, T, B>(
+    node: &TapeNode<T, B>,
+    dy: &Tensor<T, B>,
+    size_dict: &HashMap<usize, usize>,
+    grads: &mut [Option<Tensor<T, B>>],
+) where
+    A: Algebra<Scalar = T, Index = u32>,
+    T: Scalar + BackendScalar<B>,
+    B: Backend,
+{
+    match &node.op {
+        TapeOp::Leaf { tensor_index } => {
+            grads[*tensor_index] = Some(dy.clone());
         }
-        NestedEinsum::Node { args, .. } => {
-            for (arg, sibling) in args.iter().zip(grad_tree.siblings.iter()) {
-                extract_leaves_impl(arg, sibling, result);
-            }
+        TapeOp::Unary {
+            input_ix,
+            output_ix,
+        } => {
+            let child = &node.children[0];
+            let grad_child = if A::needs_argmax() {
+                let argmax = node
+                    .argmax
+                    .as_ref()
+                    .expect("Tropical unary backward requires argmax from forward pass");
+                tropical_unary_backward::<T, B>(dy, argmax, child.content.shape())
+            } else {
+                contract_unary_backward::<A, T, B>(dy, input_ix, output_ix, size_dict)
+            };
+            backprop_tape_node::<A, T, B>(child, &grad_child, size_dict, grads);
+        }
+        TapeOp::Binary {
+            left_ix,
+            right_ix,
+            output_ix,
+        } => {
+            let left = &node.children[0];
+            let right = &node.children[1];
+            let (grad_left, grad_right) = contract_binary_backward::<A, T, B>(
+                dy,
+                &left.content,
+                &right.content,
+                node.argmax.as_ref(),
+                left_ix,
+                right_ix,
+                output_ix,
+            );
+            backprop_tape_node::<A, T, B>(left, &grad_left, size_dict, grads);
+            backprop_tape_node::<A, T, B>(right, &grad_right, size_dict, grads);
         }
     }
 }
@@ -539,20 +659,10 @@ pub fn cost_and_gradient<A, T, B>(
 where
     A: Algebra<Scalar = T, Index = u32>,
     T: Scalar + BackendScalar<B>,
-    B: Backend + Default,
+    B: Backend,
 {
-    // Require optimization
-    let tree = code
-        .contraction_tree()
-        .expect("cost_and_gradient requires optimized Einsum. Call optimize_greedy() first.");
-
-    // Handle single tensor case specially
-    if xs.len() == 1 {
-        return cost_and_gradient_unary::<A, T, B>(code, xs[0], dy);
-    }
-
-    // Forward pass with caching
-    let cache = cached_einsum::<A, T, B>(tree, xs, &code.size_dict);
+    let tape = build_gradient_tape::<A, T, B>(code, xs);
+    let cost = tape.result();
 
     // Initialize dy if not provided
     let dy_tensor = match dy {
@@ -564,60 +674,13 @@ where
                 "cost_and_gradient: output must be scalar when dy is None. Got output indices: {:?}",
                 code.iy
             );
-            Tensor::from_data(&[A::one().to_scalar()], &[])
+            Tensor::from_data_with_backend(&[A::one().to_scalar()], &[], cost.backend().clone())
         }
     };
 
-    // Backward pass through the tree
-    let grad_tree = back_propagate::<A, T, B>(tree, &cache, &dy_tensor, &code.size_dict);
+    let grads = tape.backward::<A>(&dy_tensor);
 
-    // Extract leaf gradients
-    let grads = extract_leaves(tree, &grad_tree, xs.len());
-
-    (cache.content, grads)
-}
-
-/// Handle unary case for cost_and_gradient.
-fn cost_and_gradient_unary<A, T, B>(
-    code: &Einsum<usize>,
-    x: &Tensor<T, B>,
-    dy: Option<&Tensor<T, B>>,
-) -> (Tensor<T, B>, Vec<Tensor<T, B>>)
-where
-    A: Algebra<Scalar = T, Index = u32>,
-    T: Scalar + BackendScalar<B>,
-    B: Backend + Default,
-{
-    // Forward pass
-    let (result, argmax) = if A::needs_argmax() {
-        super::engine::execute_unary_with_argmax::<A, T, B>(x, &code.ixs[0], &code.iy, &code.size_dict)
-    } else {
-        (
-            super::engine::execute_unary_naive::<A, T, B>(x, &code.ixs[0], &code.iy, &code.size_dict),
-            Tensor::from_data(&[0u32], &[]), // Dummy, won't be used
-        )
-    };
-
-    // Initialize dy if not provided
-    let dy_tensor = match dy {
-        Some(d) => d.clone(),
-        None => {
-            assert!(
-                code.iy.is_empty(),
-                "cost_and_gradient: output must be scalar when dy is None"
-            );
-            Tensor::from_data(&[A::one().to_scalar()], &[])
-        }
-    };
-
-    // Backward pass
-    let grad = if A::needs_argmax() {
-        tropical_unary_backward::<T, B>(&dy_tensor, &argmax, x.shape())
-    } else {
-        contract_unary_backward::<A, T, B>(&dy_tensor, &code.ixs[0], &code.iy, &code.size_dict)
-    };
-
-    (result, vec![grad])
+    (cost, grads)
 }
 
 #[cfg(test)]
@@ -838,10 +901,8 @@ mod tests {
         let (result, grad_fn) = einsum_with_grad::<Standard<f64>, _, _>(&[input], &[ix], iy);
 
         // Create gradient output of all ones
-        let grad_output = Tensor::<f64, Cpu>::from_data(
-            &vec![1.0; result.to_vec().len()],
-            result.shape(),
-        );
+        let grad_output =
+            Tensor::<f64, Cpu>::from_data(&vec![1.0; result.to_vec().len()], result.shape());
         let grads = grad_fn.backward::<Standard<f64>>(&grad_output, &[input]);
         let grad = &grads[0];
 
@@ -860,8 +921,10 @@ mod tests {
             .map(|(x, g)| x - eta * g)
             .collect();
         let perturbed = Tensor::<f64, Cpu>::from_data(&perturbed_vec, input.shape());
-        let f_x_perturbed: f64 =
-            einsum::<Standard<f64>, _, _>(&[&perturbed], &[ix], iy).to_vec().iter().sum();
+        let f_x_perturbed: f64 = einsum::<Standard<f64>, _, _>(&[&perturbed], &[ix], iy)
+            .to_vec()
+            .iter()
+            .sum();
 
         let actual_change = f_x - f_x_perturbed;
         let error = (actual_change - expected_change).abs();
@@ -884,10 +947,8 @@ mod tests {
     ) -> (bool, f64, f64) {
         let (result, grad_fn) = einsum_with_grad::<Standard<f64>, _, _>(&[a, b], &[ia, ib], iy);
 
-        let grad_output = Tensor::<f64, Cpu>::from_data(
-            &vec![1.0; result.to_vec().len()],
-            result.shape(),
-        );
+        let grad_output =
+            Tensor::<f64, Cpu>::from_data(&vec![1.0; result.to_vec().len()], result.shape());
         let grads = grad_fn.backward::<Standard<f64>>(&grad_output, &[a, b]);
 
         // Check gradient of A
@@ -904,8 +965,10 @@ mod tests {
         let perturbed_a = Tensor::<f64, Cpu>::from_data(&perturbed_a_vec, a.shape());
 
         let f_orig: f64 = result.to_vec().iter().sum();
-        let f_perturbed_a: f64 =
-            einsum::<Standard<f64>, _, _>(&[&perturbed_a, b], &[ia, ib], iy).to_vec().iter().sum();
+        let f_perturbed_a: f64 = einsum::<Standard<f64>, _, _>(&[&perturbed_a, b], &[ia, ib], iy)
+            .to_vec()
+            .iter()
+            .sum();
 
         let actual_a = f_orig - f_perturbed_a;
         let error_a = (actual_a - expected_a).abs();
@@ -923,8 +986,10 @@ mod tests {
             .collect();
         let perturbed_b = Tensor::<f64, Cpu>::from_data(&perturbed_b_vec, b.shape());
 
-        let f_perturbed_b: f64 =
-            einsum::<Standard<f64>, _, _>(&[a, &perturbed_b], &[ia, ib], iy).to_vec().iter().sum();
+        let f_perturbed_b: f64 = einsum::<Standard<f64>, _, _>(&[a, &perturbed_b], &[ia, ib], iy)
+            .to_vec()
+            .iter()
+            .sum();
 
         let actual_b = f_orig - f_perturbed_b;
         let error_b = (actual_b - expected_b).abs();
@@ -950,7 +1015,10 @@ mod tests {
     #[test]
     fn test_bpcheck_trace_4d() {
         // 4D trace: ijji -> (trace over both pairs)
-        let a = Tensor::<f64, Cpu>::from_data(&(1..=16).map(|x| x as f64).collect::<Vec<_>>(), &[2, 2, 2, 2]);
+        let a = Tensor::<f64, Cpu>::from_data(
+            &(1..=16).map(|x| x as f64).collect::<Vec<_>>(),
+            &[2, 2, 2, 2],
+        );
         let (passed, error) = bpcheck_unary(&a, &[0, 1, 1, 0], &[], 1e-5, 1e-8);
         assert!(passed, "4D trace gradient failed with error {}", error);
     }
@@ -959,7 +1027,10 @@ mod tests {
     fn test_bpcheck_partial_trace() {
         // Partial trace: ijji -> i (trace over j, keep i)
         // Actually: ibbj -> ij (trace over repeated b)
-        let a = Tensor::<f64, Cpu>::from_data(&(1..=16).map(|x| x as f64).collect::<Vec<_>>(), &[2, 2, 2, 2]);
+        let a = Tensor::<f64, Cpu>::from_data(
+            &(1..=16).map(|x| x as f64).collect::<Vec<_>>(),
+            &[2, 2, 2, 2],
+        );
         let (passed, error) = bpcheck_unary(&a, &[0, 1, 1, 2], &[0, 2], 1e-5, 1e-8);
         assert!(passed, "Partial trace gradient failed with error {}", error);
     }
@@ -967,7 +1038,10 @@ mod tests {
     #[test]
     fn test_bpcheck_diagonal() {
         // Diagonal extraction: ibbj -> ibj (extract diagonal along b)
-        let a = Tensor::<f64, Cpu>::from_data(&(1..=16).map(|x| x as f64).collect::<Vec<_>>(), &[2, 2, 2, 2]);
+        let a = Tensor::<f64, Cpu>::from_data(
+            &(1..=16).map(|x| x as f64).collect::<Vec<_>>(),
+            &[2, 2, 2, 2],
+        );
         let (passed, error) = bpcheck_unary(&a, &[0, 1, 1, 2], &[0, 1, 2], 1e-5, 1e-8);
         assert!(passed, "Diagonal gradient failed with error {}", error);
     }
@@ -983,15 +1057,25 @@ mod tests {
     #[test]
     fn test_bpcheck_permutation_4d() {
         // 4D permutation: ijkl -> klij
-        let a = Tensor::<f64, Cpu>::from_data(&(1..=16).map(|x| x as f64).collect::<Vec<_>>(), &[2, 2, 2, 2]);
+        let a = Tensor::<f64, Cpu>::from_data(
+            &(1..=16).map(|x| x as f64).collect::<Vec<_>>(),
+            &[2, 2, 2, 2],
+        );
         let (passed, error) = bpcheck_unary(&a, &[0, 1, 2, 3], &[2, 3, 0, 1], 1e-5, 1e-8);
-        assert!(passed, "4D permutation gradient failed with error {}", error);
+        assert!(
+            passed,
+            "4D permutation gradient failed with error {}",
+            error
+        );
     }
 
     #[test]
     fn test_bpcheck_sum_reduction() {
         // Sum: ijk -> ij (sum over k)
-        let a = Tensor::<f64, Cpu>::from_data(&(1..=8).map(|x| x as f64).collect::<Vec<_>>(), &[2, 2, 2]);
+        let a = Tensor::<f64, Cpu>::from_data(
+            &(1..=8).map(|x| x as f64).collect::<Vec<_>>(),
+            &[2, 2, 2],
+        );
         let (passed, error) = bpcheck_unary(&a, &[0, 1, 2], &[0, 1], 1e-5, 1e-8);
         assert!(passed, "Sum reduction gradient failed with error {}", error);
     }
@@ -1014,7 +1098,11 @@ mod tests {
         let a = Tensor::<f64, Cpu>::from_data(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
         let b = Tensor::<f64, Cpu>::from_data(&[5.0, 6.0, 7.0, 8.0], &[2, 2]);
         let (passed, err_a, err_b) = bpcheck_binary(&a, &b, &[0, 1], &[1, 2], &[0, 2], 1e-5, 1e-8);
-        assert!(passed, "Matmul gradient failed: err_a={}, err_b={}", err_a, err_b);
+        assert!(
+            passed,
+            "Matmul gradient failed: err_a={}, err_b={}",
+            err_a, err_b
+        );
     }
 
     #[test]
@@ -1025,7 +1113,11 @@ mod tests {
         let a = Tensor::<f64, Cpu>::from_data(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
         let b = Tensor::<f64, Cpu>::from_data(&[5.0, 6.0, 7.0, 8.0], &[2, 2]);
         let (passed, err_a, err_b) = bpcheck_binary(&a, &b, &[0, 1], &[1, 2], &[0, 2], 1e-5, 1e-8);
-        assert!(passed, "Matmul chain gradient failed: err_a={}, err_b={}", err_a, err_b);
+        assert!(
+            passed,
+            "Matmul chain gradient failed: err_a={}, err_b={}",
+            err_a, err_b
+        );
     }
 
     #[test]
@@ -1034,7 +1126,11 @@ mod tests {
         let a = Tensor::<f64, Cpu>::from_data(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
         let b = Tensor::<f64, Cpu>::from_data(&[5.0, 6.0, 7.0, 8.0], &[2, 2]);
         let (passed, err_a, err_b) = bpcheck_binary(&a, &b, &[0, 1], &[0, 1], &[0, 1], 1e-5, 1e-8);
-        assert!(passed, "Hadamard gradient failed: err_a={}, err_b={}", err_a, err_b);
+        assert!(
+            passed,
+            "Hadamard gradient failed: err_a={}, err_b={}",
+            err_a, err_b
+        );
     }
 
     #[test]
@@ -1042,8 +1138,13 @@ mod tests {
         // Outer product: ij,kl -> ijkl
         let a = Tensor::<f64, Cpu>::from_data(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
         let b = Tensor::<f64, Cpu>::from_data(&[5.0, 6.0, 7.0, 8.0], &[2, 2]);
-        let (passed, err_a, err_b) = bpcheck_binary(&a, &b, &[0, 1], &[2, 3], &[0, 1, 2, 3], 1e-5, 1e-8);
-        assert!(passed, "Outer product gradient failed: err_a={}, err_b={}", err_a, err_b);
+        let (passed, err_a, err_b) =
+            bpcheck_binary(&a, &b, &[0, 1], &[2, 3], &[0, 1, 2, 3], 1e-5, 1e-8);
+        assert!(
+            passed,
+            "Outer product gradient failed: err_a={}, err_b={}",
+            err_a, err_b
+        );
     }
 
     #[test]
@@ -1052,7 +1153,11 @@ mod tests {
         let a = Tensor::<f64, Cpu>::from_data(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
         let b = Tensor::<f64, Cpu>::from_data(&[5.0, 6.0, 7.0, 8.0], &[2, 2]);
         let (passed, err_a, err_b) = bpcheck_binary(&a, &b, &[0, 1], &[0, 1], &[], 1e-5, 1e-8);
-        assert!(passed, "Contract to scalar gradient failed: err_a={}, err_b={}", err_a, err_b);
+        assert!(
+            passed,
+            "Contract to scalar gradient failed: err_a={}, err_b={}",
+            err_a, err_b
+        );
     }
 
     #[test]
@@ -1065,27 +1170,50 @@ mod tests {
         // b has indices (2, 1) meaning "b=2, i=1"
         // output is (0, 2) meaning "ab"
         let (passed, err_a, err_b) = bpcheck_binary(&a, &b, &[0, 1], &[2, 1], &[0, 2], 1e-5, 1e-8);
-        assert!(passed, "Star contraction gradient failed: err_a={}, err_b={}", err_a, err_b);
+        assert!(
+            passed,
+            "Star contraction gradient failed: err_a={}, err_b={}",
+            err_a, err_b
+        );
     }
 
     #[test]
     fn test_bpcheck_tensor_contraction() {
         // Tensor contraction: ijkl,kl -> ij
-        let t = Tensor::<f64, Cpu>::from_data(&(1..=16).map(|x| x as f64).collect::<Vec<_>>(), &[2, 2, 2, 2]);
+        let t = Tensor::<f64, Cpu>::from_data(
+            &(1..=16).map(|x| x as f64).collect::<Vec<_>>(),
+            &[2, 2, 2, 2],
+        );
         let m = Tensor::<f64, Cpu>::from_data(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
-        let (passed, err_t, err_m) = bpcheck_binary(&t, &m, &[0, 1, 2, 3], &[2, 3], &[0, 1], 1e-5, 1e-8);
-        assert!(passed, "Tensor contraction gradient failed: err_t={}, err_m={}", err_t, err_m);
+        let (passed, err_t, err_m) =
+            bpcheck_binary(&t, &m, &[0, 1, 2, 3], &[2, 3], &[0, 1], 1e-5, 1e-8);
+        assert!(
+            passed,
+            "Tensor contraction gradient failed: err_t={}, err_m={}",
+            err_t, err_m
+        );
     }
 
     #[test]
     fn test_bpcheck_batched_matmul() {
         // Batched matmul: bij,bjk -> bik
         // Use smaller values to reduce numerical error accumulation
-        let a = Tensor::<f64, Cpu>::from_data(&[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2], &[2, 2, 3]);
-        let b = Tensor::<f64, Cpu>::from_data(&[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2], &[2, 3, 2]);
+        let a = Tensor::<f64, Cpu>::from_data(
+            &[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2],
+            &[2, 2, 3],
+        );
+        let b = Tensor::<f64, Cpu>::from_data(
+            &[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2],
+            &[2, 3, 2],
+        );
         // Use looser tolerance for 3D tensors due to accumulated numerical error
-        let (passed, err_a, err_b) = bpcheck_binary(&a, &b, &[0, 1, 2], &[0, 2, 3], &[0, 1, 3], 1e-5, 1e-4);
-        assert!(passed, "Batched matmul gradient failed: err_a={}, err_b={}", err_a, err_b);
+        let (passed, err_a, err_b) =
+            bpcheck_binary(&a, &b, &[0, 1, 2], &[0, 2, 3], &[0, 1, 3], 1e-5, 1e-4);
+        assert!(
+            passed,
+            "Batched matmul gradient failed: err_a={}, err_b={}",
+            err_a, err_b
+        );
     }
 
     #[test]
@@ -1094,7 +1222,11 @@ mod tests {
         let a = Tensor::<f64, Cpu>::from_data(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
         let v = Tensor::<f64, Cpu>::from_data(&[1.0, 2.0], &[2]);
         let (passed, err_a, err_v) = bpcheck_binary(&a, &v, &[0, 1], &[1], &[0], 1e-5, 1e-8);
-        assert!(passed, "Matvec gradient failed: err_a={}, err_v={}", err_a, err_v);
+        assert!(
+            passed,
+            "Matvec gradient failed: err_a={}, err_v={}",
+            err_a, err_v
+        );
     }
 
     // ========================================================================
@@ -1122,8 +1254,16 @@ mod tests {
         let grads = grad_fn.backward::<Standard<f64>>(&grad_output, &[&ab, &c]);
 
         // Verify gradient shapes
-        assert_eq!(grads[0].shape(), ab.shape(), "Gradient of AB should match AB shape");
-        assert_eq!(grads[1].shape(), c.shape(), "Gradient of C should match C shape");
+        assert_eq!(
+            grads[0].shape(),
+            ab.shape(),
+            "Gradient of AB should match AB shape"
+        );
+        assert_eq!(
+            grads[1].shape(),
+            c.shape(),
+            "Gradient of C should match C shape"
+        );
 
         // Verify gradients are non-zero
         let grad_ab_sum: f64 = grads[0].to_vec().iter().sum();
@@ -1176,7 +1316,8 @@ mod tests {
 
         // Outer product: a ⊗ b
         let sizes: HashMap<usize, usize> = [(0, 3), (1, 2)].into();
-        let ein_outer = crate::einsum::Einsum::new(vec![vec![0], vec![1]], vec![0, 1], sizes.clone());
+        let ein_outer =
+            crate::einsum::Einsum::new(vec![vec![0], vec![1]], vec![0, 1], sizes.clone());
         let outer = ein_outer.execute::<Standard<f64>, f64, Cpu>(&[&a, &b]);
 
         // Sum all elements
@@ -1223,7 +1364,7 @@ mod tests {
 
         let (result, grad_fn) = einsum_with_grad::<Standard<f64>, _, _>(
             &[&a, &b],
-            &[&[0, 1], &[1, 0]],  // ij,ji->
+            &[&[0, 1], &[1, 0]], // ij,ji->
             &[],
         );
 
@@ -1245,7 +1386,10 @@ mod tests {
         // Both gradients should have same sum
         let sum_a: f64 = grad_a_vec.iter().sum();
         let sum_b: f64 = grad_b_vec.iter().sum();
-        assert!((sum_a - sum_b).abs() < 1e-10, "Symmetric gradients should have equal sum");
+        assert!(
+            (sum_a - sum_b).abs() < 1e-10,
+            "Symmetric gradients should have equal sum"
+        );
 
         // Verify result: trace(A @ B) = 1*1 + 3*2 + 2*3 + 4*4 = 1 + 6 + 6 + 16 = 29
         // Wait, ij,ji-> means A[i,j] * B[j,i], not A[i,j] * B[i,j]
@@ -1262,11 +1406,8 @@ mod tests {
 
         // Outer product: a ⊗ b -> [2, 3]
         let _sizes: HashMap<usize, usize> = [(0, 2), (1, 3)].into();
-        let (outer, grad_fn) = einsum_with_grad::<Standard<f64>, _, _>(
-            &[&a, &b],
-            &[&[0], &[1]],
-            &[0, 1],
-        );
+        let (outer, grad_fn) =
+            einsum_with_grad::<Standard<f64>, _, _>(&[&a, &b], &[&[0], &[1]], &[0, 1]);
 
         assert_eq!(outer.shape(), &[2, 3]);
 
@@ -1280,8 +1421,14 @@ mod tests {
         let grad_a_expected: f64 = b.to_vec().iter().sum();
         let grad_b_expected: f64 = a.to_vec().iter().sum();
 
-        assert!(grads[0].to_vec().iter().all(|&x| (x - grad_a_expected).abs() < 1e-10));
-        assert!(grads[1].to_vec().iter().all(|&x| (x - grad_b_expected).abs() < 1e-10));
+        assert!(grads[0]
+            .to_vec()
+            .iter()
+            .all(|&x| (x - grad_a_expected).abs() < 1e-10));
+        assert!(grads[1]
+            .to_vec()
+            .iter()
+            .all(|&x| (x - grad_b_expected).abs() < 1e-10));
     }
 
     // ========================================================================
@@ -1542,18 +1689,14 @@ mod tests {
     #[ignore = "Requires omeco fix: https://github.com/GiggleLiu/omeco/issues/13"]
     fn test_julia_bp_triangle() {
         // A[2,3], B[3,4], C[4,2] -> scalar
-        let a = Tensor::<f64, Cpu>::from_data(
-            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-            &[2, 3],
-        );
+        let a = Tensor::<f64, Cpu>::from_data(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
         let b = Tensor::<f64, Cpu>::from_data(
-            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+            &[
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+            ],
             &[3, 4],
         );
-        let c = Tensor::<f64, Cpu>::from_data(
-            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-            &[4, 2],
-        );
+        let c = Tensor::<f64, Cpu>::from_data(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[4, 2]);
 
         let sizes: HashMap<usize, usize> = [(0, 2), (1, 3), (2, 4)].into();
         assert!(bpcheck_cost_and_gradient(
@@ -1628,7 +1771,8 @@ mod tests {
             .collect();
         let perturbed = Tensor::<f64, Cpu>::from_data(&perturbed_vec, a.shape());
 
-        let (cost_perturbed, _) = cost_and_gradient::<Standard<f64>, _, _>(&ein, &[&perturbed], None);
+        let (cost_perturbed, _) =
+            cost_and_gradient::<Standard<f64>, _, _>(&ein, &[&perturbed], None);
         let actual_change = cost.to_vec()[0] - cost_perturbed.to_vec()[0];
 
         assert!(
