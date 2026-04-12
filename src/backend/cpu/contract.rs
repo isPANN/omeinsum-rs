@@ -78,6 +78,214 @@ pub(super) fn compute_permutation(
     target.iter().map(|m| mode_position(current, *m)).collect()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MaterializationPlan {
+    NoCopy,
+    MakeContiguous,
+    Permute { perm: Vec<usize>, shape: Vec<usize> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContractionLayoutPlan {
+    batch_modes: Vec<i32>,
+    left_modes: Vec<i32>,
+    right_modes: Vec<i32>,
+    contracted_modes: Vec<i32>,
+    left_materialization: MaterializationPlan,
+    right_materialization: MaterializationPlan,
+    output_perm: Option<Vec<usize>>,
+    batch_size: usize,
+    left_size: usize,
+    right_size: usize,
+    contract_size: usize,
+}
+
+fn physical_axis_order(strides: &[usize]) -> Vec<usize> {
+    let mut axes: Vec<usize> = (0..strides.len()).collect();
+    axes.sort_by_key(|&axis| (strides[axis], axis));
+    axes
+}
+
+fn is_flattenable_group(
+    shape: &[usize],
+    strides: &[usize],
+    axes: &[usize],
+    require_unit_base: bool,
+) -> bool {
+    if axes.is_empty() {
+        return true;
+    }
+
+    let mut expected = if require_unit_base { 1 } else { strides[axes[0]] };
+    if require_unit_base && strides[axes[0]] != 1 {
+        return false;
+    }
+
+    for &axis in axes {
+        if strides[axis] != expected {
+            return false;
+        }
+        expected = expected.saturating_mul(shape[axis].max(1));
+    }
+
+    true
+}
+
+fn is_permutation_like(shape: &[usize], strides: &[usize], physical_order: &[usize]) -> bool {
+    let mut expected = 1usize;
+    for &axis in physical_order {
+        if strides[axis] != expected {
+            return false;
+        }
+        expected = expected.saturating_mul(shape[axis].max(1));
+    }
+    true
+}
+
+fn analyze_operand_materialization(
+    shape: &[usize],
+    strides: &[usize],
+    modes: &[i32],
+    batch_modes: &[i32],
+    row_modes: &[i32],
+    col_modes: &[i32],
+) -> MaterializationPlan {
+    let batch_axes: Vec<usize> = batch_modes
+        .iter()
+        .map(|&mode| mode_position(modes, mode))
+        .collect();
+    let row_axes: Vec<usize> = row_modes.iter().map(|&mode| mode_position(modes, mode)).collect();
+    let col_axes: Vec<usize> = col_modes.iter().map(|&mode| mode_position(modes, mode)).collect();
+    let physical_order = physical_axis_order(strides);
+
+    let mut no_copy_orders = vec![batch_axes
+        .iter()
+        .chain(row_axes.iter())
+        .chain(col_axes.iter())
+        .copied()
+        .collect::<Vec<_>>()];
+    if row_axes != col_axes {
+        no_copy_orders.push(
+            batch_axes
+                .iter()
+                .chain(col_axes.iter())
+                .chain(row_axes.iter())
+                .copied()
+                .collect(),
+        );
+    }
+
+    let batch_len = batch_axes.len();
+    let row_len = row_axes.len();
+    for order in &no_copy_orders {
+        let rows = &order[batch_len..batch_len + row_len];
+        let cols = &order[batch_len + row_len..];
+        if *order == physical_order
+            && is_flattenable_group(shape, strides, &batch_axes, !batch_axes.is_empty())
+            && is_flattenable_group(shape, strides, rows, false)
+            && is_flattenable_group(shape, strides, cols, false)
+        {
+            return MaterializationPlan::NoCopy;
+        }
+    }
+
+    if is_permutation_like(shape, strides, &physical_order) {
+        let target_axes: Vec<usize> = batch_axes
+            .iter()
+            .chain(row_axes.iter())
+            .chain(col_axes.iter())
+            .copied()
+            .collect();
+        let perm: Vec<usize> = target_axes
+            .iter()
+            .map(|axis| {
+                physical_order
+                    .iter()
+                    .position(|physical_axis| physical_axis == axis)
+                    .expect("axis must exist in physical order")
+            })
+            .collect();
+        let physical_shape: Vec<usize> = physical_order.iter().map(|&axis| shape[axis]).collect();
+        return MaterializationPlan::Permute {
+            perm,
+            shape: physical_shape,
+        };
+    }
+
+    MaterializationPlan::MakeContiguous
+}
+
+fn analyze_contraction_layout(
+    shape_a: &[usize],
+    strides_a: &[usize],
+    modes_a: &[i32],
+    shape_b: &[usize],
+    strides_b: &[usize],
+    modes_b: &[i32],
+    modes_c: &[i32],
+) -> ContractionLayoutPlan {
+    let (batch_modes, left_candidates, right_candidates, contracted_modes) =
+        classify_modes(modes_a, modes_b, modes_c);
+    let output_set: HashSet<i32> = modes_c.iter().copied().collect();
+    let left_modes: Vec<i32> = left_candidates
+        .into_iter()
+        .filter(|mode| output_set.contains(mode))
+        .collect();
+    let right_modes: Vec<i32> = right_candidates
+        .into_iter()
+        .filter(|mode| output_set.contains(mode))
+        .collect();
+
+    let left_materialization = analyze_operand_materialization(
+        shape_a,
+        strides_a,
+        modes_a,
+        &batch_modes,
+        &left_modes,
+        &contracted_modes,
+    );
+    let right_materialization = analyze_operand_materialization(
+        shape_b,
+        strides_b,
+        modes_b,
+        &batch_modes,
+        &contracted_modes,
+        &right_modes,
+    );
+
+    let current_output: Vec<i32> = left_modes
+        .iter()
+        .chain(right_modes.iter())
+        .chain(batch_modes.iter())
+        .copied()
+        .collect();
+    let output_perm = (current_output != modes_c).then(|| {
+        modes_c
+            .iter()
+            .map(|mode| {
+                current_output
+                    .iter()
+                    .position(|current_mode| current_mode == mode)
+                    .expect("output mode must exist in current output")
+            })
+            .collect()
+    });
+
+    ContractionLayoutPlan {
+        batch_size: product_of_dims(&batch_modes, modes_a, shape_a),
+        left_size: product_of_dims(&left_modes, modes_a, shape_a),
+        right_size: product_of_dims(&right_modes, modes_b, shape_b),
+        contract_size: product_of_dims(&contracted_modes, modes_a, shape_a),
+        batch_modes,
+        left_modes,
+        right_modes,
+        contracted_modes,
+        left_materialization,
+        right_materialization,
+        output_perm,
+    }
+}
+
 use crate::algebra::Algebra;
 use crate::backend::Cpu;
 use crate::tensor::compute_contiguous_strides;
@@ -165,7 +373,7 @@ where
     let b_contig = ensure_contiguous(b, shape_b, strides_b);
 
     // 2. Classify modes
-    let (batch, left, right, contracted) = classify_modes(modes_a, modes_b, modes_c);
+    let (_batch, left, right, _contracted) = classify_modes(modes_a, modes_b, modes_c);
 
     // 3. Handle trace modes: modes in only one input that are NOT in the output.
     //    GEMM can only contract modes shared by both inputs. Single-input modes
@@ -193,69 +401,80 @@ where
         (b_contig, shape_b.to_vec(), modes_b.to_vec())
     };
 
-    // Free modes (left/right modes that ARE in the output)
-    let left_free: Vec<i32> = left.iter().filter(|m| c_set.contains(m)).copied().collect();
-    let right_free: Vec<i32> = right
-        .iter()
-        .filter(|m| c_set.contains(m))
-        .copied()
-        .collect();
+    let a_layout_strides = compute_contiguous_strides(&a_shape);
+    let b_layout_strides = compute_contiguous_strides(&b_shape);
+    let plan = analyze_contraction_layout(
+        &a_shape,
+        &a_layout_strides,
+        &a_modes,
+        &b_shape,
+        &b_layout_strides,
+        &b_modes,
+        modes_c,
+    );
 
-    // 4. Compute dimension sizes (using reduced inputs)
-    let batch_size = product_of_dims(&batch, &a_modes, &a_shape);
-    let left_size = product_of_dims(&left_free, &a_modes, &a_shape);
-    let right_size = product_of_dims(&right_free, &b_modes, &b_shape);
-    let contract_size = product_of_dims(&contracted, &a_modes, &a_shape);
-
-    // 5. Permute A to [left_free, contracted, batch] - batch LAST for correct memory layout
-    let a_perm = compute_permutation(&a_modes, &left_free, &contracted, &batch);
+    // 4. Permute A to [left_free, contracted, batch] - batch LAST for current GEMM layout
+    let a_perm = compute_permutation(
+        &a_modes,
+        &plan.left_modes,
+        &plan.contracted_modes,
+        &plan.batch_modes,
+    );
     let a_permuted = permute_data(&a_data, &a_shape, &a_perm);
 
-    // 6. Permute B to [contracted, right_free, batch] - batch LAST
-    let b_perm = compute_permutation(&b_modes, &contracted, &right_free, &batch);
+    // 5. Permute B to [contracted, right_free, batch] - batch LAST
+    let b_perm = compute_permutation(
+        &b_modes,
+        &plan.contracted_modes,
+        &plan.right_modes,
+        &plan.batch_modes,
+    );
     let b_permuted = permute_data(&b_data, &b_shape, &b_perm);
 
-    // 7. Call GEMM
-    let c_data = if batch.is_empty() {
+    // 6. Call GEMM
+    let c_data = if plan.batch_modes.is_empty() {
         cpu.gemm_internal::<A>(
             &a_permuted,
-            left_size,
-            contract_size,
+            plan.left_size,
+            plan.contract_size,
             &b_permuted,
-            right_size,
+            plan.right_size,
         )
     } else {
         cpu.gemm_batched_internal::<A>(
             &a_permuted,
-            batch_size,
-            left_size,
-            contract_size,
+            plan.batch_size,
+            plan.left_size,
+            plan.contract_size,
             &b_permuted,
-            right_size,
+            plan.right_size,
         )
     };
 
-    // 8. Permute result to output order
+    // 7. Permute result to output order
     // Result is in [left_free, right_free, batch] order
-    let current_order: Vec<i32> = left_free
+    let current_order: Vec<i32> = plan
+        .left_modes
         .iter()
-        .chain(right_free.iter())
-        .chain(batch.iter())
+        .chain(plan.right_modes.iter())
+        .chain(plan.batch_modes.iter())
         .copied()
         .collect();
 
-    if current_order == modes_c {
+    if plan.output_perm.is_none() {
         c_data
     } else {
         let c_shape_current: Vec<usize> = current_order
             .iter()
             .map(|&m| shape_c[mode_position(modes_c, m)])
             .collect();
-        let out_perm: Vec<usize> = modes_c
-            .iter()
-            .map(|m| current_order.iter().position(|x| x == m).unwrap())
-            .collect();
-        permute_data(&c_data, &c_shape_current, &out_perm)
+        permute_data(
+            &c_data,
+            &c_shape_current,
+            plan.output_perm
+                .as_ref()
+                .expect("output permutation must exist"),
+        )
     }
 }
 
@@ -480,5 +699,44 @@ mod tests {
         // Current: [0, 1, 2], want: [0, 2, 1]
         let perm = compute_permutation(&[0, 1, 2], &[0], &[2], &[1]);
         assert_eq!(perm, vec![0, 2, 1]);
+    }
+
+    #[test]
+    fn test_analyze_contraction_layout_detects_copy_free_matmul() {
+        let plan = analyze_contraction_layout(
+            &[2, 3],
+            &[1, 2],
+            &[0, 1],
+            &[3, 4],
+            &[1, 3],
+            &[1, 2],
+            &[0, 2],
+        );
+
+        assert!(plan.batch_modes.is_empty());
+        assert_eq!(plan.left_modes, vec![0]);
+        assert_eq!(plan.right_modes, vec![2]);
+        assert_eq!(plan.contracted_modes, vec![1]);
+        assert!(matches!(plan.left_materialization, MaterializationPlan::NoCopy));
+        assert!(matches!(plan.right_materialization, MaterializationPlan::NoCopy));
+    }
+
+    #[test]
+    fn test_analyze_contraction_layout_marks_single_side_materialization() {
+        let plan = analyze_contraction_layout(
+            &[2, 2, 2],
+            &[1, 2, 4],
+            &[0, 1, 2],
+            &[2, 2, 2],
+            &[2, 1, 4],
+            &[0, 2, 3],
+            &[0, 1, 3],
+        );
+
+        assert!(matches!(plan.left_materialization, MaterializationPlan::NoCopy));
+        assert!(matches!(
+            plan.right_materialization,
+            MaterializationPlan::Permute { .. }
+        ));
     }
 }
