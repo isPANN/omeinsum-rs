@@ -286,6 +286,7 @@ fn analyze_contraction_layout(
     }
 }
 
+use super::MatrixLayout;
 use crate::algebra::Algebra;
 use crate::backend::Cpu;
 use crate::tensor::compute_contiguous_strides;
@@ -350,6 +351,67 @@ where
     (result, new_shape, new_modes)
 }
 
+fn group_base_stride(modes: &[i32], strides: &[usize], group_modes: &[i32]) -> isize {
+    group_modes
+        .first()
+        .map(|&mode| strides[mode_position(modes, mode)] as isize)
+        .unwrap_or(0)
+}
+
+fn matrix_layout_from_operand<'a, T>(
+    data: &'a [T],
+    shape: &[usize],
+    strides: &[usize],
+    modes: &[i32],
+    row_modes: &[i32],
+    col_modes: &[i32],
+) -> MatrixLayout<'a, T> {
+    MatrixLayout {
+        data,
+        rows: product_of_dims(row_modes, modes, shape),
+        cols: product_of_dims(col_modes, modes, shape),
+        row_stride: group_base_stride(modes, strides, row_modes),
+        col_stride: group_base_stride(modes, strides, col_modes),
+    }
+}
+
+fn materialize_matrix_operand<T: Copy + Default>(
+    data: &[T],
+    shape: &[usize],
+    strides: &[usize],
+    modes: &[i32],
+    row_modes: &[i32],
+    col_modes: &[i32],
+) -> Vec<T> {
+    let contiguous = ensure_contiguous(data, shape, strides);
+    let perm = compute_permutation(modes, row_modes, col_modes, &[]);
+    permute_data(&contiguous, shape, &perm)
+}
+
+fn finalize_contraction_output<T: Copy + Default>(
+    c_data: Vec<T>,
+    plan: &ContractionLayoutPlan,
+    shape_c: &[usize],
+    modes_c: &[i32],
+) -> Vec<T> {
+    if let Some(output_perm) = &plan.output_perm {
+        let current_order: Vec<i32> = plan
+            .left_modes
+            .iter()
+            .chain(plan.right_modes.iter())
+            .chain(plan.batch_modes.iter())
+            .copied()
+            .collect();
+        let c_shape_current: Vec<usize> = current_order
+            .iter()
+            .map(|&mode| shape_c[mode_position(modes_c, mode)])
+            .collect();
+        permute_data(&c_data, &c_shape_current, output_perm)
+    } else {
+        c_data
+    }
+}
+
 /// Execute tensor contraction on CPU via reshape→GEMM→reshape.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn contract<A: Algebra>(
@@ -368,14 +430,10 @@ pub(super) fn contract<A: Algebra>(
 where
     A::Scalar: crate::algebra::Scalar,
 {
-    // 1. Make inputs contiguous if needed
-    let a_contig = ensure_contiguous(a, shape_a, strides_a);
-    let b_contig = ensure_contiguous(b, shape_b, strides_b);
-
-    // 2. Classify modes
+    // 1. Classify modes
     let (_batch, left, right, _contracted) = classify_modes(modes_a, modes_b, modes_c);
 
-    // 3. Handle trace modes: modes in only one input that are NOT in the output.
+    // 2. Handle trace modes: modes in only one input that are NOT in the output.
     //    GEMM can only contract modes shared by both inputs. Single-input modes
     //    not in the output must be summed over (traced) before GEMM.
     let c_set: HashSet<i32> = modes_c.iter().copied().collect();
@@ -390,6 +448,77 @@ where
         .copied()
         .collect();
 
+    if left_trace.is_empty() && right_trace.is_empty() {
+        let plan =
+            analyze_contraction_layout(shape_a, strides_a, modes_a, shape_b, strides_b, modes_b, modes_c);
+        if plan.batch_modes.is_empty() {
+            let left_nocopy = matches!(plan.left_materialization, MaterializationPlan::NoCopy);
+            let right_nocopy = matches!(plan.right_materialization, MaterializationPlan::NoCopy);
+            if left_nocopy || right_nocopy {
+                let left_materialized;
+                let a_layout = if left_nocopy {
+                    matrix_layout_from_operand(
+                        a,
+                        shape_a,
+                        strides_a,
+                        modes_a,
+                        &plan.left_modes,
+                        &plan.contracted_modes,
+                    )
+                } else {
+                    left_materialized = materialize_matrix_operand(
+                        a,
+                        shape_a,
+                        strides_a,
+                        modes_a,
+                        &plan.left_modes,
+                        &plan.contracted_modes,
+                    );
+                    MatrixLayout::column_major(
+                        &left_materialized,
+                        plan.left_size,
+                        plan.contract_size,
+                    )
+                };
+
+                let right_materialized;
+                let b_layout = if right_nocopy {
+                    matrix_layout_from_operand(
+                        b,
+                        shape_b,
+                        strides_b,
+                        modes_b,
+                        &plan.contracted_modes,
+                        &plan.right_modes,
+                    )
+                } else {
+                    right_materialized = materialize_matrix_operand(
+                        b,
+                        shape_b,
+                        strides_b,
+                        modes_b,
+                        &plan.contracted_modes,
+                        &plan.right_modes,
+                    );
+                    MatrixLayout::column_major(
+                        &right_materialized,
+                        plan.contract_size,
+                        plan.right_size,
+                    )
+                };
+
+                if let Some(c_data) = cpu.gemm_standard_layout_internal::<A>(a_layout, b_layout) {
+                    return finalize_contraction_output(c_data, &plan, shape_c, modes_c);
+                }
+            }
+        }
+    }
+
+    // 3. Make inputs contiguous if needed for the generic materialized path.
+    let a_contig = ensure_contiguous(a, shape_a, strides_a);
+    let b_contig = ensure_contiguous(b, shape_b, strides_b);
+
+    // 4. Reduce trace modes before generic GEMM.
     let (a_data, a_shape, a_modes) = if !left_trace.is_empty() {
         reduce_trace_modes::<A>(&a_contig, shape_a, modes_a, &left_trace)
     } else {
@@ -413,7 +542,7 @@ where
         modes_c,
     );
 
-    // 4. Permute A to [left_free, contracted, batch] - batch LAST for current GEMM layout
+    // 5. Permute A to [left_free, contracted, batch] - batch LAST for current GEMM layout
     let a_perm = compute_permutation(
         &a_modes,
         &plan.left_modes,
@@ -422,7 +551,7 @@ where
     );
     let a_permuted = permute_data(&a_data, &a_shape, &a_perm);
 
-    // 5. Permute B to [contracted, right_free, batch] - batch LAST
+    // 6. Permute B to [contracted, right_free, batch] - batch LAST
     let b_perm = compute_permutation(
         &b_modes,
         &plan.contracted_modes,
@@ -431,7 +560,7 @@ where
     );
     let b_permuted = permute_data(&b_data, &b_shape, &b_perm);
 
-    // 6. Call GEMM
+    // 7. Call GEMM
     let c_data = if plan.batch_modes.is_empty() {
         cpu.gemm_internal::<A>(
             &a_permuted,
@@ -451,31 +580,7 @@ where
         )
     };
 
-    // 7. Permute result to output order
-    // Result is in [left_free, right_free, batch] order
-    let current_order: Vec<i32> = plan
-        .left_modes
-        .iter()
-        .chain(plan.right_modes.iter())
-        .chain(plan.batch_modes.iter())
-        .copied()
-        .collect();
-
-    if plan.output_perm.is_none() {
-        c_data
-    } else {
-        let c_shape_current: Vec<usize> = current_order
-            .iter()
-            .map(|&m| shape_c[mode_position(modes_c, m)])
-            .collect();
-        permute_data(
-            &c_data,
-            &c_shape_current,
-            plan.output_perm
-                .as_ref()
-                .expect("output permutation must exist"),
-        )
-    }
+    finalize_contraction_output(c_data, &plan, shape_c, modes_c)
 }
 
 /// Ensure data is contiguous (copy if strided).

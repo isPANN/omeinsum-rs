@@ -10,7 +10,128 @@ use std::any::TypeId;
 #[derive(Clone, Debug, Default)]
 pub struct Cpu;
 
+#[derive(Clone, Copy)]
+pub(crate) struct MatrixLayout<'a, T> {
+    pub data: &'a [T],
+    pub rows: usize,
+    pub cols: usize,
+    pub row_stride: isize,
+    pub col_stride: isize,
+}
+
+impl<'a, T> MatrixLayout<'a, T> {
+    pub(crate) fn column_major(data: &'a [T], rows: usize, cols: usize) -> Self {
+        Self {
+            data,
+            rows,
+            cols,
+            row_stride: 1,
+            col_stride: rows as isize,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn column_major_transposed(data: &'a [T], rows: usize, cols: usize) -> Self {
+        Self {
+            data,
+            rows,
+            cols,
+            row_stride: cols as isize,
+            col_stride: 1,
+        }
+    }
+}
+
+fn layout_offset_bounds<T>(layout: &MatrixLayout<'_, T>) -> (isize, isize) {
+    let row_extent = if layout.rows == 0 {
+        0
+    } else {
+        (layout.rows as isize - 1) * layout.row_stride
+    };
+    let col_extent = if layout.cols == 0 {
+        0
+    } else {
+        (layout.cols as isize - 1) * layout.col_stride
+    };
+    let offsets = [0, row_extent, col_extent, row_extent + col_extent];
+    (
+        *offsets.iter().min().expect("offset bounds must exist"),
+        *offsets.iter().max().expect("offset bounds must exist"),
+    )
+}
+
+fn faer_mat_ref<'a, T>(layout: MatrixLayout<'a, T>) -> faer::MatRef<'a, T> {
+    let (min_offset, max_offset) = layout_offset_bounds(&layout);
+    if layout.rows > 0 && layout.cols > 0 {
+        assert!(!layout.data.is_empty(), "matrix layout requires backing storage");
+        assert!(
+            max_offset >= min_offset,
+            "matrix layout offsets must be ordered"
+        );
+        assert!(
+            ((max_offset - min_offset) as usize) < layout.data.len(),
+            "matrix layout exceeds backing storage"
+        );
+    }
+
+    let ptr = unsafe { layout.data.as_ptr().offset(-min_offset) };
+    unsafe {
+        faer::MatRef::from_raw_parts(
+            ptr,
+            layout.rows,
+            layout.cols,
+            layout.row_stride,
+            layout.col_stride,
+        )
+    }
+}
+
 impl Cpu {
+    pub(crate) fn gemm_standard_layout_internal<A: Algebra>(
+        &self,
+        a: MatrixLayout<'_, A::Scalar>,
+        b: MatrixLayout<'_, A::Scalar>,
+    ) -> Option<Vec<A::Scalar>> {
+        if TypeId::of::<A>() == TypeId::of::<Standard<f32>>() {
+            let a_f32 = MatrixLayout {
+                data: unsafe { std::mem::transmute::<&[A::Scalar], &[f32]>(a.data) },
+                rows: a.rows,
+                cols: a.cols,
+                row_stride: a.row_stride,
+                col_stride: a.col_stride,
+            };
+            let b_f32 = MatrixLayout {
+                data: unsafe { std::mem::transmute::<&[A::Scalar], &[f32]>(b.data) },
+                rows: b.rows,
+                cols: b.cols,
+                row_stride: b.row_stride,
+                col_stride: b.col_stride,
+            };
+            let result = faer_gemm_f32_layout(a_f32, b_f32);
+            return Some(unsafe { std::mem::transmute::<Vec<f32>, Vec<A::Scalar>>(result) });
+        }
+        if TypeId::of::<A>() == TypeId::of::<Standard<f64>>() {
+            let a_f64 = MatrixLayout {
+                data: unsafe { std::mem::transmute::<&[A::Scalar], &[f64]>(a.data) },
+                rows: a.rows,
+                cols: a.cols,
+                row_stride: a.row_stride,
+                col_stride: a.col_stride,
+            };
+            let b_f64 = MatrixLayout {
+                data: unsafe { std::mem::transmute::<&[A::Scalar], &[f64]>(b.data) },
+                rows: b.rows,
+                cols: b.cols,
+                row_stride: b.row_stride,
+                col_stride: b.col_stride,
+            };
+            let result = faer_gemm_f64_layout(a_f64, b_f64);
+            return Some(unsafe { std::mem::transmute::<Vec<f64>, Vec<A::Scalar>>(result) });
+        }
+
+        None
+    }
+
     /// General matrix multiplication (internal implementation).
     ///
     /// Computes C = A ⊗ B where ⊗ is the semiring multiplication
@@ -354,6 +475,23 @@ fn faer_gemm_f32(a: &[f32], m: usize, k: usize, b: &[f32], n: usize) -> Vec<f32>
     c
 }
 
+fn faer_gemm_f32_layout(a: MatrixLayout<'_, f32>, b: MatrixLayout<'_, f32>) -> Vec<f32> {
+    use faer::{linalg::matmul::matmul, Accum, Mat, Par};
+
+    let a_mat = faer_mat_ref(a);
+    let b_mat = faer_mat_ref(b);
+    let mut c_mat = Mat::<f32>::zeros(a.rows, b.cols);
+    matmul(c_mat.as_mut(), Accum::Replace, a_mat, b_mat, 1.0f32, Par::Seq);
+
+    let mut c = vec![0.0f32; a.rows * b.cols];
+    for j in 0..b.cols {
+        for i in 0..a.rows {
+            c[j * a.rows + i] = c_mat[(i, j)];
+        }
+    }
+    c
+}
+
 /// GEMM using faer for f64 (column-major layout).
 fn faer_gemm_f64(a: &[f64], m: usize, k: usize, b: &[f64], n: usize) -> Vec<f64> {
     use faer::Mat;
@@ -367,6 +505,23 @@ fn faer_gemm_f64(a: &[f64], m: usize, k: usize, b: &[f64], n: usize) -> Vec<f64>
     for j in 0..n {
         for i in 0..m {
             c[j * m + i] = c_mat[(i, j)];
+        }
+    }
+    c
+}
+
+fn faer_gemm_f64_layout(a: MatrixLayout<'_, f64>, b: MatrixLayout<'_, f64>) -> Vec<f64> {
+    use faer::{linalg::matmul::matmul, Accum, Mat, Par};
+
+    let a_mat = faer_mat_ref(a);
+    let b_mat = faer_mat_ref(b);
+    let mut c_mat = Mat::<f64>::zeros(a.rows, b.cols);
+    matmul(c_mat.as_mut(), Accum::Replace, a_mat, b_mat, 1.0f64, Par::Seq);
+
+    let mut c = vec![0.0f64; a.rows * b.cols];
+    for j in 0..b.cols {
+        for i in 0..a.rows {
+            c[j * a.rows + i] = c_mat[(i, j)];
         }
     }
     c
@@ -660,6 +815,20 @@ mod tests {
         // [1 2] × [1 2] = [1*1+2*3  1*2+2*4] = [7  10]
         // [3 4]   [3 4]   [3*1+4*3  3*2+4*4]   [15 22]
         assert_eq!(c, vec![7.0, 10.0, 15.0, 22.0]);
+    }
+
+    #[test]
+    fn test_faer_layout_gemm_accepts_rhs_transpose_view() {
+        let a = vec![1.0f32, 2.0, 3.0, 4.0];
+        let b = vec![1.0f32, 2.0, 3.0, 4.0];
+
+        let c = faer_gemm_f32_layout(
+            MatrixLayout::column_major(&a, 2, 2),
+            MatrixLayout::column_major_transposed(&b, 2, 2),
+        );
+
+        let expected = faer_gemm_f32(&a, 2, 2, &[1.0, 3.0, 2.0, 4.0], 2);
+        assert_eq!(c, expected);
     }
 
     #[cfg(feature = "tropical")]

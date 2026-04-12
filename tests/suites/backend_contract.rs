@@ -198,6 +198,44 @@ fn test_cpu_contract_both_strided() {
     assert_eq!(c, vec![59.0, 78.0, 83.0, 110.0]);
 }
 
+#[test]
+fn test_cpu_contract_rhs_transpose_view_matches_contiguous_rhs() {
+    let cpu = Cpu;
+
+    let a = vec![1.0f64, 2.0, 3.0, 4.0];
+    let b = vec![1.0f64, 2.0, 3.0, 4.0];
+    let b_contiguous_transpose = vec![1.0f64, 3.0, 2.0, 4.0];
+
+    let strided = cpu.contract::<Standard<f64>>(
+        &a,
+        &[2, 2],
+        &[1, 2],
+        &[0, 1],
+        &b,
+        &[2, 2],
+        &[2, 1],
+        &[1, 2],
+        &[2, 2],
+        &[0, 2],
+    );
+
+    let contiguous = cpu.contract::<Standard<f64>>(
+        &a,
+        &[2, 2],
+        &[1, 2],
+        &[0, 1],
+        &b_contiguous_transpose,
+        &[2, 2],
+        &[1, 2],
+        &[1, 2],
+        &[2, 2],
+        &[0, 2],
+    );
+
+    assert_eq!(strided, contiguous);
+    assert_eq!(strided, vec![10.0, 14.0, 14.0, 20.0]);
+}
+
 // ============================================================================
 // Tests for output permutation
 // ============================================================================
