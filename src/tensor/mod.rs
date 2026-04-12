@@ -13,6 +13,7 @@ use std::sync::Arc;
 use crate::algebra::{Algebra, Scalar};
 use crate::backend::{Backend, Storage};
 
+pub(crate) use ops::BinaryContractOptions;
 pub use view::TensorView;
 
 /// A multi-dimensional tensor with stride-based layout.
