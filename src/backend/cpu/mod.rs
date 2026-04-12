@@ -65,7 +65,10 @@ fn layout_offset_bounds<T>(layout: &MatrixLayout<'_, T>) -> (isize, isize) {
 fn faer_mat_ref<'a, T>(layout: MatrixLayout<'a, T>) -> faer::MatRef<'a, T> {
     let (min_offset, max_offset) = layout_offset_bounds(&layout);
     if layout.rows > 0 && layout.cols > 0 {
-        assert!(!layout.data.is_empty(), "matrix layout requires backing storage");
+        assert!(
+            !layout.data.is_empty(),
+            "matrix layout requires backing storage"
+        );
         assert!(
             max_offset >= min_offset,
             "matrix layout offsets must be ordered"
@@ -88,7 +91,10 @@ fn faer_mat_ref<'a, T>(layout: MatrixLayout<'a, T>) -> faer::MatRef<'a, T> {
     }
 }
 
-fn matrix_layout_batch_view<'a, T>(layout: MatrixLayout<'a, T>, batch: usize) -> MatrixLayout<'a, T> {
+fn matrix_layout_batch_view<'a, T>(
+    layout: MatrixLayout<'a, T>,
+    batch: usize,
+) -> MatrixLayout<'a, T> {
     assert!(batch < layout.data.len(), "batch offset must be in bounds");
     MatrixLayout {
         data: &layout.data[batch..],
@@ -559,7 +565,14 @@ fn faer_gemm_f32_layout(a: MatrixLayout<'_, f32>, b: MatrixLayout<'_, f32>) -> V
     let a_mat = faer_mat_ref(a);
     let b_mat = faer_mat_ref(b);
     let mut c_mat = Mat::<f32>::zeros(a.rows, b.cols);
-    matmul(c_mat.as_mut(), Accum::Replace, a_mat, b_mat, 1.0f32, Par::Seq);
+    matmul(
+        c_mat.as_mut(),
+        Accum::Replace,
+        a_mat,
+        b_mat,
+        1.0f32,
+        Par::Seq,
+    );
 
     let mut c = vec![0.0f32; a.rows * b.cols];
     for j in 0..b.cols {
@@ -594,7 +607,14 @@ fn faer_gemm_f64_layout(a: MatrixLayout<'_, f64>, b: MatrixLayout<'_, f64>) -> V
     let a_mat = faer_mat_ref(a);
     let b_mat = faer_mat_ref(b);
     let mut c_mat = Mat::<f64>::zeros(a.rows, b.cols);
-    matmul(c_mat.as_mut(), Accum::Replace, a_mat, b_mat, 1.0f64, Par::Seq);
+    matmul(
+        c_mat.as_mut(),
+        Accum::Replace,
+        a_mat,
+        b_mat,
+        1.0f64,
+        Par::Seq,
+    );
 
     let mut c = vec![0.0f64; a.rows * b.cols];
     for j in 0..b.cols {

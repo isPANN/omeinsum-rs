@@ -89,20 +89,12 @@ impl<T: Scalar, B: Backend> Tensor<T, B> {
     where
         T: BackendScalar<B>,
     {
-        let (result, _) = self.contract_binary_impl_with_options::<A>(
-            other,
-            ia,
-            ib,
-            iy,
-            false,
-            options,
-        );
+        let (result, _) =
+            self.contract_binary_impl_with_options::<A>(other, ia, ib, iy, false, options);
         result
     }
 
-    pub(crate) fn contract_binary_with_argmax_with_options<
-        A: Algebra<Scalar = T, Index = u32>,
-    >(
+    pub(crate) fn contract_binary_with_argmax_with_options<A: Algebra<Scalar = T, Index = u32>>(
         &self,
         other: &Self,
         ia: &[usize],
@@ -113,14 +105,8 @@ impl<T: Scalar, B: Backend> Tensor<T, B> {
     where
         T: BackendScalar<B>,
     {
-        let (result, argmax) = self.contract_binary_impl_with_options::<A>(
-            other,
-            ia,
-            ib,
-            iy,
-            true,
-            options,
-        );
+        let (result, argmax) =
+            self.contract_binary_impl_with_options::<A>(other, ia, ib, iy, true, options);
         (result, argmax.expect("argmax requested but not returned"))
     }
 
@@ -160,10 +146,7 @@ impl<T: Scalar, B: Backend> Tensor<T, B> {
         assert_eq!(ia.len(), self.ndim(), "ia length must match self.ndim()");
         assert_eq!(ib.len(), other.ndim(), "ib length must match other.ndim()");
 
-        let output_indices = options
-            .preferred_output_indices
-            .as_deref()
-            .unwrap_or(iy);
+        let output_indices = options.preferred_output_indices.as_deref().unwrap_or(iy);
         if let Some(preferred_output_indices) = &options.preferred_output_indices {
             let mut preferred_sorted = preferred_output_indices.clone();
             preferred_sorted.sort_unstable();

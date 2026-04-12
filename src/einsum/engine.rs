@@ -152,7 +152,12 @@ impl Einsum<usize> {
                     if emit_final_root_output {
                         result
                     } else {
-                        finalize_optimized_result::<A, T, B>(result, tree, &self.iy, &self.size_dict)
+                        finalize_optimized_result::<A, T, B>(
+                            result,
+                            tree,
+                            &self.iy,
+                            &self.size_dict,
+                        )
                     }
                 }
             }
@@ -251,18 +256,10 @@ impl Einsum<usize> {
             NestedEinsum::Node { args, eins } => {
                 assert_eq!(args.len(), 2, "Expected binary contraction tree");
 
-                let left = self.execute_tree_with_argmax::<A, T, B>(
-                    &args[0],
-                    tensors,
-                    argmax_cache,
-                    None,
-                );
-                let right = self.execute_tree_with_argmax::<A, T, B>(
-                    &args[1],
-                    tensors,
-                    argmax_cache,
-                    None,
-                );
+                let left =
+                    self.execute_tree_with_argmax::<A, T, B>(&args[0], tensors, argmax_cache, None);
+                let right =
+                    self.execute_tree_with_argmax::<A, T, B>(&args[1], tensors, argmax_cache, None);
 
                 let ia = &eins.ixs[0];
                 let ib = &eins.ixs[1];
@@ -278,29 +275,26 @@ impl Einsum<usize> {
                 );
 
                 if A::needs_argmax() {
-                    let (result, argmax) = if let Some(preferred_output_indices) =
-                        preferred_output_indices
-                    {
-                        let options = BinaryContractOptions {
-                            preferred_output_indices: Some(preferred_output_indices.to_vec()),
+                    let (result, argmax) =
+                        if let Some(preferred_output_indices) = preferred_output_indices {
+                            let options = BinaryContractOptions {
+                                preferred_output_indices: Some(preferred_output_indices.to_vec()),
+                            };
+                            left.contract_binary_with_argmax_with_options::<A>(
+                                &right, &ia, &ib, iy, &options,
+                            )
+                        } else {
+                            left.contract_binary_with_argmax::<A>(&right, &ia, &ib, iy)
                         };
-                        left.contract_binary_with_argmax_with_options::<A>(
-                            &right, &ia, &ib, iy, &options,
-                        )
-                    } else {
-                        left.contract_binary_with_argmax::<A>(&right, &ia, &ib, iy)
-                    };
                     argmax_cache.push(argmax);
                     result
+                } else if let Some(preferred_output_indices) = preferred_output_indices {
+                    let options = BinaryContractOptions {
+                        preferred_output_indices: Some(preferred_output_indices.to_vec()),
+                    };
+                    left.contract_binary_with_options::<A>(&right, &ia, &ib, iy, &options)
                 } else {
-                    if let Some(preferred_output_indices) = preferred_output_indices {
-                        let options = BinaryContractOptions {
-                            preferred_output_indices: Some(preferred_output_indices.to_vec()),
-                        };
-                        left.contract_binary_with_options::<A>(&right, &ia, &ib, iy, &options)
-                    } else {
-                        left.contract_binary::<A>(&right, &ia, &ib, iy)
-                    }
+                    left.contract_binary::<A>(&right, &ia, &ib, iy)
                 }
             }
         }

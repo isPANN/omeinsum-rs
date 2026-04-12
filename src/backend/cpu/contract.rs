@@ -116,7 +116,11 @@ fn is_flattenable_group(
         return true;
     }
 
-    let mut expected = if require_unit_base { 1 } else { strides[axes[0]] };
+    let mut expected = if require_unit_base {
+        1
+    } else {
+        strides[axes[0]]
+    };
     if require_unit_base && strides[axes[0]] != 1 {
         return false;
     }
@@ -154,8 +158,14 @@ fn analyze_operand_materialization(
         .iter()
         .map(|&mode| mode_position(modes, mode))
         .collect();
-    let row_axes: Vec<usize> = row_modes.iter().map(|&mode| mode_position(modes, mode)).collect();
-    let col_axes: Vec<usize> = col_modes.iter().map(|&mode| mode_position(modes, mode)).collect();
+    let row_axes: Vec<usize> = row_modes
+        .iter()
+        .map(|&mode| mode_position(modes, mode))
+        .collect();
+    let col_axes: Vec<usize> = col_modes
+        .iter()
+        .map(|&mode| mode_position(modes, mode))
+        .collect();
     let physical_order = physical_axis_order(strides);
 
     let mut no_copy_orders = vec![batch_axes
@@ -489,8 +499,9 @@ where
         .collect();
 
     if left_trace.is_empty() && right_trace.is_empty() {
-        let plan =
-            analyze_contraction_layout(shape_a, strides_a, modes_a, shape_b, strides_b, modes_b, modes_c);
+        let plan = analyze_contraction_layout(
+            shape_a, strides_a, modes_a, shape_b, strides_b, modes_b, modes_c,
+        );
         let left_nocopy = matches!(plan.left_materialization, MaterializationPlan::NoCopy);
         let right_nocopy = matches!(plan.right_materialization, MaterializationPlan::NoCopy);
         if left_nocopy || right_nocopy {
@@ -593,13 +604,7 @@ where
     };
 
     let plan = analyze_contraction_layout(
-        &a_shape,
-        &a_strides,
-        &a_modes,
-        &b_shape,
-        &b_strides,
-        &b_modes,
-        modes_c,
+        &a_shape, &a_strides, &a_modes, &b_shape, &b_strides, &b_modes, modes_c,
     );
 
     // 5. Permute A to [left_free, contracted, batch] - batch LAST for current GEMM layout
@@ -613,7 +618,13 @@ where
     let a_permuted = if let Some(ref a_data) = a_reduced {
         permute_data_into(a_data, &a_shape, &a_perm, a_permuted_scratch.as_mut_vec())
     } else {
-        materialize_with_permutation_into(a, &a_shape, &a_strides, &a_perm, a_permuted_scratch.as_mut_vec())
+        materialize_with_permutation_into(
+            a,
+            &a_shape,
+            &a_strides,
+            &a_perm,
+            a_permuted_scratch.as_mut_vec(),
+        )
     };
 
     // 6. Permute B to [contracted, right_free, batch] - batch LAST
@@ -627,7 +638,13 @@ where
     let b_permuted = if let Some(ref b_data) = b_reduced {
         permute_data_into(b_data, &b_shape, &b_perm, b_permuted_scratch.as_mut_vec())
     } else {
-        materialize_with_permutation_into(b, &b_shape, &b_strides, &b_perm, b_permuted_scratch.as_mut_vec())
+        materialize_with_permutation_into(
+            b,
+            &b_shape,
+            &b_strides,
+            &b_perm,
+            b_permuted_scratch.as_mut_vec(),
+        )
     };
 
     // 7. Call GEMM
@@ -897,8 +914,14 @@ mod tests {
         assert_eq!(plan.left_modes, vec![0]);
         assert_eq!(plan.right_modes, vec![2]);
         assert_eq!(plan.contracted_modes, vec![1]);
-        assert!(matches!(plan.left_materialization, MaterializationPlan::NoCopy));
-        assert!(matches!(plan.right_materialization, MaterializationPlan::NoCopy));
+        assert!(matches!(
+            plan.left_materialization,
+            MaterializationPlan::NoCopy
+        ));
+        assert!(matches!(
+            plan.right_materialization,
+            MaterializationPlan::NoCopy
+        ));
     }
 
     #[test]
@@ -913,7 +936,10 @@ mod tests {
             &[0, 1, 3],
         );
 
-        assert!(matches!(plan.left_materialization, MaterializationPlan::NoCopy));
+        assert!(matches!(
+            plan.left_materialization,
+            MaterializationPlan::NoCopy
+        ));
         assert!(matches!(
             plan.right_materialization,
             MaterializationPlan::Permute { .. }
@@ -934,7 +960,13 @@ mod tests {
 
         assert_eq!(plan.batch_modes, vec![0]);
         assert_eq!(plan.batch_size, 2);
-        assert!(matches!(plan.left_materialization, MaterializationPlan::NoCopy));
-        assert!(matches!(plan.right_materialization, MaterializationPlan::NoCopy));
+        assert!(matches!(
+            plan.left_materialization,
+            MaterializationPlan::NoCopy
+        ));
+        assert!(matches!(
+            plan.right_materialization,
+            MaterializationPlan::NoCopy
+        ));
     }
 }
