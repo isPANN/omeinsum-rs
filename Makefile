@@ -2,6 +2,11 @@
 # Automates environment setup, testing, documentation, and examples
 
 NON_GPU_FEATURES := tropical parallel
+BENCH_SCENARIO ?= all
+BENCH_ITERATIONS ?= 40
+BENCH_WARMUP ?= 5
+BENCH_DIM ?= 128
+BENCH_BATCH ?= 24
 
 .PHONY: all build build-debug cargo-check check test test-gpu test-release bench docs clean help
 .PHONY: setup setup-rust
@@ -40,7 +45,9 @@ help:
 	@echo "  test-release   - Run tests in release mode (non-GPU features)"
 	@echo ""
 	@echo "Benchmark targets:"
-	@echo "  bench          - Run benchmarks"
+	@echo "  bench          - Run the CPU contraction benchmark example"
+	@echo "                   Override BENCH_SCENARIO, BENCH_ITERATIONS, BENCH_WARMUP,"
+	@echo "                   BENCH_DIM, or BENCH_BATCH to tune the run"
 	@echo ""
 	@echo "Example targets:"
 	@echo "  example-basic     - Run basic einsum example"
@@ -126,8 +133,8 @@ test-release:
 #==============================================================================
 
 bench:
-	@echo "Running benchmarks..."
-	cargo bench
+	@echo "Running CPU contraction benchmarks..."
+	cargo run --release --example cpu_contract_bench -- --scenario "$(BENCH_SCENARIO)" --iterations "$(BENCH_ITERATIONS)" --warmup "$(BENCH_WARMUP)" --dim "$(BENCH_DIM)" --batch "$(BENCH_BATCH)"
 	@echo "Benchmarks complete."
 
 #==============================================================================
