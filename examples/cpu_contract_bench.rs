@@ -12,6 +12,7 @@ use omeinsum::{Cpu, Einsum, Standard, Tensor};
 enum Scenario {
     All,
     RhsTransposeView,
+    ColumnMajorBatched,
     BatchMajorBatched,
     RootOutputPermutation,
 }
@@ -21,11 +22,12 @@ impl Scenario {
         match value {
             "all" => Ok(Self::All),
             "rhs-transpose-view" => Ok(Self::RhsTransposeView),
+            "column-major-batched" => Ok(Self::ColumnMajorBatched),
             "batch-major-batched" => Ok(Self::BatchMajorBatched),
             "root-output-permutation" => Ok(Self::RootOutputPermutation),
             _ => Err(format!(
                 "unknown scenario `{value}`; expected one of all, rhs-transpose-view, \
-                 batch-major-batched, root-output-permutation"
+                 column-major-batched, batch-major-batched, root-output-permutation"
             )),
         }
     }
@@ -56,7 +58,7 @@ fn usage() -> &'static str {
     "Usage: cargo run --release --example cpu_contract_bench -- [options]
 
 Options:
-  --scenario <all|rhs-transpose-view|batch-major-batched|root-output-permutation>
+  --scenario <all|rhs-transpose-view|column-major-batched|batch-major-batched|root-output-permutation>
   --iterations <count>
   --warmup <count>
   --dim <matrix-dimension>
@@ -230,6 +232,64 @@ fn bench_rhs_transpose_view(config: Config) {
     });
 }
 
+fn bench_column_major_batched(config: Config) {
+    let cpu = Cpu;
+    let matrix_numel = config.dim * config.dim;
+    let numel = config.batch * matrix_numel;
+    let a = seeded_data(numel, 8);
+    let b = seeded_data(numel, 9);
+    let strides = [matrix_numel, 1, config.dim];
+
+    let batched = cpu.contract::<Standard<f32>>(
+        &a,
+        &[config.batch, config.dim, config.dim],
+        &strides,
+        &[0, 1, 2],
+        &b,
+        &[config.batch, config.dim, config.dim],
+        &strides,
+        &[0, 2, 3],
+        &[config.batch, config.dim, config.dim],
+        &[0, 1, 3],
+    );
+    let mut reference = vec![0.0f32; numel];
+    for batch in 0..config.batch {
+        let offset = batch * matrix_numel;
+        for col in 0..config.dim {
+            for row in 0..config.dim {
+                let mut acc = 0.0f32;
+                for kk in 0..config.dim {
+                    acc += a[offset + kk * config.dim + row] * b[offset + col * config.dim + kk];
+                }
+                reference[batch + row * config.batch + col * config.batch * config.dim] = acc;
+            }
+        }
+    }
+    assert!(
+        batched
+            .iter()
+            .zip(&reference)
+            .all(|(actual, expected)| (actual - expected).abs() <= 1e-3 * expected.abs().max(1.0)),
+        "column-major batched benchmark sanity check failed"
+    );
+
+    run_benchmark("column-major-batched", config, || {
+        let result = cpu.contract::<Standard<f32>>(
+            &a,
+            &[config.batch, config.dim, config.dim],
+            &strides,
+            &[0, 1, 2],
+            &b,
+            &[config.batch, config.dim, config.dim],
+            &strides,
+            &[0, 2, 3],
+            &[config.batch, config.dim, config.dim],
+            &[0, 1, 3],
+        );
+        black_box(result[0]) + black_box(*result.last().expect("result must be non-empty"))
+    });
+}
+
 fn bench_batch_major_batched(config: Config) {
     let cpu = Cpu;
     let numel = config.batch * config.dim * config.dim;
@@ -324,10 +384,12 @@ fn main() {
     match config.scenario {
         Scenario::All => {
             bench_rhs_transpose_view(config);
+            bench_column_major_batched(config);
             bench_batch_major_batched(config);
             bench_root_output_permutation(config);
         }
         Scenario::RhsTransposeView => bench_rhs_transpose_view(config),
+        Scenario::ColumnMajorBatched => bench_column_major_batched(config),
         Scenario::BatchMajorBatched => bench_batch_major_batched(config),
         Scenario::RootOutputPermutation => bench_root_output_permutation(config),
     }

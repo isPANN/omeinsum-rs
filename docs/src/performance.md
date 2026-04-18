@@ -82,6 +82,7 @@ Tune the benchmark mix or problem size with make variables:
 
 ```bash
 make bench-cpu-contract BENCH_SCENARIO=rhs-transpose-view BENCH_DIM=192 BENCH_ITERATIONS=60
+make bench-cpu-contract BENCH_SCENARIO=column-major-batched BENCH_BATCH=32 BENCH_DIM=128
 make bench-cpu-contract BENCH_SCENARIO=batch-major-batched BENCH_BATCH=32 BENCH_DIM=128
 make bench-cpu-contract BENCH_SCENARIO=root-output-permutation BENCH_DIM=160
 ```
