@@ -14,7 +14,7 @@ BENCH_BATCH ?= 24
 .PHONY: fmt fmt-check clippy lint coverage
 .PHONY: example-basic example-tropical
 .PHONY: cli
-.PHONY: release copilot-review run-plan
+.PHONY: release copilot-review run-plan run-release
 
 # Cross-platform sed in-place: macOS needs -i '', Linux needs -i
 SED_I := sed -i$(shell if [ "$$(uname)" = "Darwin" ]; then echo " ''"; fi)
@@ -78,7 +78,8 @@ help:
 	@echo "  cli            - Build and install the omeinsum CLI to ~/.cargo/bin"
 	@echo ""
 	@echo "Release targets:"
-	@echo "  release V=x.y.z - Tag and push a new release (triggers CI publish)"
+	@echo "  release V=x.y.z - Tag and create a GitHub release (triggers CI publish)"
+	@echo "  run-release     - Use the repo-local release skill to prepare a release"
 	@echo "  copilot-review   - Request Copilot code review on current PR"
 	@echo ""
 	@echo "Agent targets:"
@@ -251,13 +252,25 @@ ifndef V
 	$(error Usage: make release V=x.y.z)
 endif
 	@echo "Releasing v$(V)..."
-	$(SED_I) 's/^version = ".*"/version = "$(V)"/' Cargo.toml
+	@test "$$(git branch --show-current)" = "main" || { echo "release must run from main"; exit 1; }
+	@test -z "$$(git status --porcelain)" || { echo "release requires a clean worktree"; exit 1; }
+	@if git ls-remote --exit-code --tags origin "refs/tags/v$(V)" >/dev/null 2>&1 || git rev-parse -q --verify "refs/tags/v$(V)" >/dev/null; then \
+		echo "tag v$(V) already exists"; \
+		exit 1; \
+	fi
+	$(SED_I) 's/^version = ".*"/version = "$(V)"/' Cargo.toml omeinsum-cli/Cargo.toml
 	cargo check
-	git add Cargo.toml
-	git commit -m "release: v$(V)"
+	git add Cargo.toml omeinsum-cli/Cargo.toml Cargo.lock
+	@if ! git diff --cached --quiet; then \
+		git commit -m "release: v$(V)"; \
+	else \
+		echo "Version files already set to $(V); no release version commit needed."; \
+	fi
 	git tag -a "v$(V)" -m "Release v$(V)"
-	git push origin main --tags
-	@echo "v$(V) pushed — CI will publish to crates.io"
+	git push origin HEAD:main
+	git push origin "v$(V)"
+	gh release create "v$(V)" --title "v$(V)" --generate-notes --latest
+	@echo "v$(V) GitHub release created — release workflow will publish to crates.io"
 
 # Request Copilot code review on the current PR
 # Requires: gh extension install ChrisCarini/gh-copilot-review
@@ -273,6 +286,7 @@ copilot-review:
 RUNNER ?= codex
 CLAUDE_MODEL ?= opus
 CODEX_MODEL ?= gpt-5.4
+RELEASE_OUTPUT ?= run-release-output.log
 
 # Run a plan with Codex or Claude
 # Usage: make run-plan [INSTRUCTIONS="..."] [OUTPUT=output.log] [RUNNER=codex]
@@ -302,3 +316,20 @@ run-plan:
 	PROMPT="$${PROMPT}$${NL}$${NL}## Process$${NL}$${PROCESS}$${NL}$${NL}## Rules$${NL}- Tests should be strong enough to catch regressions.$${NL}- Do not modify tests to make them pass.$${NL}- Test failure must be reported."; \
 	echo "=== Prompt ===" && echo "$$PROMPT" && echo "===" ; \
 	RUNNER="$(RUNNER)" run_agent "$(OUTPUT)" "$$PROMPT"
+
+# Run the release skill with Codex or Claude.
+# Usage: make run-release [V=x.y.z] [RUNNER=codex] [RELEASE_OUTPUT=run-release-output.log]
+run-release:
+	@. scripts/make_helpers.sh; \
+	NL=$$'\n'; \
+	if [ -n "$(V)" ]; then \
+		RELEASE_DESC="prepare and publish release v$(V)"; \
+		EXTRA="$${NL}$${NL}Requested version: $(V)"; \
+	else \
+		RELEASE_DESC="determine, prepare, and publish the next release"; \
+		EXTRA=""; \
+	fi; \
+	PROMPT=$$(skill_prompt release "/release $(V)" "$$RELEASE_DESC"); \
+	PROMPT="$${PROMPT}$${EXTRA}$${NL}$${NL}Rules:$${NL}- Verify the release before running make release.$${NL}- Do not publish from a dirty worktree.$${NL}- Report the GitHub release URL and release workflow status."; \
+	echo "=== Prompt ===" && echo "$$PROMPT" && echo "===" ; \
+	RUNNER="$(RUNNER)" run_agent "$(RELEASE_OUTPUT)" "$$PROMPT"

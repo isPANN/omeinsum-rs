@@ -60,5 +60,7 @@ Install with `make cli`. Three subcommands:
 
 Repo-local skills live under `.claude/skills/*/SKILL.md`.
 
+- `issue-to-pr` - convert a GitHub issue into a scoped implementation plan, branch, and PR
 - `review-quality` - read-only review checklist for DRY, KISS, correctness, and test quality
 - `fix-pr` - workflow for addressing PR comments, CI failures, and missing coverage
+- `release` - prepare, verify, tag, and publish a crate release
