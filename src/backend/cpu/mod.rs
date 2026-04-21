@@ -934,9 +934,23 @@ fn try_tropical_gemm<A: Algebra>(
         tropical_matmul, TropicalMaxMul, TropicalMaxPlus, TropicalMinPlus, TropicalSemiring,
     };
 
-    // Dispatch based on algebra type using TypeId
-    // The tropical-gemm types have identical repr(transparent) layout to our types,
-    // and both wrap the scalar directly, so we can safely transmute the output.
+    // Dispatch based on algebra type using TypeId. The tropical-gemm types have
+    // identical repr(transparent) layout to our types, so we can safely transmute
+    // the input slices and the output Vec.
+    //
+    // Layout note (don't "fix" the arg order — the swap is intentional):
+    // omeinsum stores tensors in column-major order (see `generic_gemm` docstring
+    // and the module-wide "column-major: idx j*nrows+i" convention). `tropical-gemm`'s
+    // `tropical_matmul` API documents its inputs/outputs as row-major. Passing our
+    // column-major bytes to a row-major callee is equivalent to passing A^T and B^T,
+    // which would compute (A^T × B^T). Using the identity
+    //     (A × B) = ((B^T × A^T))^T
+    // combined with the observation that a column-major m×k matrix's raw bytes are
+    // byte-identical to the row-major k×m representation of its transpose, we can
+    // get the intended column-major A×B out of a row-major matmul by calling
+    //     tropical_matmul(b, n, k, a, m)
+    // i.e. swap `a` ↔ `b` and swap `m` ↔ `n`. The returned row-major n×m Vec is
+    // byte-identical to the column-major m×n storage of A×B. Zero data transposes.
 
     if TypeId::of::<A>() == TypeId::of::<MaxPlus<f32>>() {
         // SAFETY: A::Scalar is f32, and MaxPlus<f32> has repr(transparent) over f32
@@ -944,7 +958,7 @@ fn try_tropical_gemm<A: Algebra>(
         let b_f32: &[f32] = unsafe { std::mem::transmute(b) };
 
         let result: Vec<TropicalMaxPlus<f32>> =
-            tropical_matmul::<TropicalMaxPlus<f32>>(a_f32, m, k, b_f32, n);
+            tropical_matmul::<TropicalMaxPlus<f32>>(b_f32, n, k, a_f32, m);
 
         // Convert TropicalMaxPlus<f32> -> f32, both are repr(transparent) over f32
         let scalars: Vec<f32> = result.into_iter().map(|x| x.value()).collect();
@@ -956,7 +970,7 @@ fn try_tropical_gemm<A: Algebra>(
         let b_f64: &[f64] = unsafe { std::mem::transmute(b) };
 
         let result: Vec<TropicalMaxPlus<f64>> =
-            tropical_matmul::<TropicalMaxPlus<f64>>(a_f64, m, k, b_f64, n);
+            tropical_matmul::<TropicalMaxPlus<f64>>(b_f64, n, k, a_f64, m);
         let scalars: Vec<f64> = result.into_iter().map(|x| x.value()).collect();
 
         Some(unsafe { std::mem::transmute(scalars) })
@@ -965,7 +979,7 @@ fn try_tropical_gemm<A: Algebra>(
         let b_f32: &[f32] = unsafe { std::mem::transmute(b) };
 
         let result: Vec<TropicalMinPlus<f32>> =
-            tropical_matmul::<TropicalMinPlus<f32>>(a_f32, m, k, b_f32, n);
+            tropical_matmul::<TropicalMinPlus<f32>>(b_f32, n, k, a_f32, m);
         let scalars: Vec<f32> = result.into_iter().map(|x| x.value()).collect();
 
         Some(unsafe { std::mem::transmute(scalars) })
@@ -974,7 +988,7 @@ fn try_tropical_gemm<A: Algebra>(
         let b_f64: &[f64] = unsafe { std::mem::transmute(b) };
 
         let result: Vec<TropicalMinPlus<f64>> =
-            tropical_matmul::<TropicalMinPlus<f64>>(a_f64, m, k, b_f64, n);
+            tropical_matmul::<TropicalMinPlus<f64>>(b_f64, n, k, a_f64, m);
         let scalars: Vec<f64> = result.into_iter().map(|x| x.value()).collect();
 
         Some(unsafe { std::mem::transmute(scalars) })
@@ -983,7 +997,7 @@ fn try_tropical_gemm<A: Algebra>(
         let b_f32: &[f32] = unsafe { std::mem::transmute(b) };
 
         let result: Vec<TropicalMaxMul<f32>> =
-            tropical_matmul::<TropicalMaxMul<f32>>(a_f32, m, k, b_f32, n);
+            tropical_matmul::<TropicalMaxMul<f32>>(b_f32, n, k, a_f32, m);
         let scalars: Vec<f32> = result.into_iter().map(|x| x.value()).collect();
 
         Some(unsafe { std::mem::transmute(scalars) })
@@ -992,7 +1006,7 @@ fn try_tropical_gemm<A: Algebra>(
         let b_f64: &[f64] = unsafe { std::mem::transmute(b) };
 
         let result: Vec<TropicalMaxMul<f64>> =
-            tropical_matmul::<TropicalMaxMul<f64>>(a_f64, m, k, b_f64, n);
+            tropical_matmul::<TropicalMaxMul<f64>>(b_f64, n, k, a_f64, m);
         let scalars: Vec<f64> = result.into_iter().map(|x| x.value()).collect();
 
         Some(unsafe { std::mem::transmute(scalars) })
@@ -1461,5 +1475,60 @@ mod tests {
 
         assert_eq!(grad_a_sum, grad_c_sum, "grad_a sum should equal grad_c sum");
         assert_eq!(grad_b_sum, grad_c_sum, "grad_b sum should equal grad_c sum");
+    }
+
+    // ------------------------------------------------------------------
+    // Layout-bug repro for `try_tropical_gemm` (see issue).
+    //
+    // Same pattern as `test_tropical_gemm_optimized_maxplus`: call both the
+    // dispatch path (which goes through `try_tropical_gemm` when
+    // `tropical-kernels` is on) and the hand-written column-major oracle
+    // `generic_gemm`, assert element-wise equality.
+    //
+    // The existing test uses m = k = n = 64 AND `a == b` bytewise. Under
+    // those conditions the row-major vs column-major transpose algebraically
+    // cancels out, so the byte-compare happens to pass. The tests below break
+    // either condition and expose the bug.
+    // ------------------------------------------------------------------
+
+    #[cfg(feature = "tropical-kernels")]
+    #[test]
+    fn layout_bug_repro_nonsquare_m_ne_n() {
+        let cpu = Cpu;
+        let (m, k, n) = (3usize, 4, 5);
+        let a: Vec<f64> = (0..m * k).map(|i| i as f64).collect();
+        let b: Vec<f64> = (0..k * n).map(|i| (i as f64) * 0.25).collect();
+        let c_opt = cpu.gemm_internal::<MaxPlus<f64>>(&a, m, k, &b, n);
+        let c_gen = generic_gemm::<MaxPlus<f64>>(&a, m, k, &b, n);
+        eprintln!("m={m} k={k} n={n}");
+        eprintln!("dispatch (SIMD path): {:?}", c_opt);
+        eprintln!("oracle   (generic)  : {:?}", c_gen);
+        for (i, (o, g)) in c_opt.iter().zip(c_gen.iter()).enumerate() {
+            assert!(
+                (o - g).abs() < 1e-9,
+                "m={m} k={k} n={n}: mismatch at idx {i}: dispatch={o}, oracle={g}",
+            );
+        }
+    }
+
+    #[cfg(feature = "tropical-kernels")]
+    #[test]
+    fn layout_bug_repro_nonsquare_with_neg_inf() {
+        let cpu = Cpu;
+        let (m, k, n) = (3usize, 4, 5);
+        let mut a: Vec<f64> = (0..m * k).map(|i| i as f64).collect();
+        a[2 * m + 1] = f64::NEG_INFINITY;
+        let b: Vec<f64> = (0..k * n).map(|i| (i as f64) * 0.25).collect();
+        let c_opt = cpu.gemm_internal::<MaxPlus<f64>>(&a, m, k, &b, n);
+        let c_gen = generic_gemm::<MaxPlus<f64>>(&a, m, k, &b, n);
+        eprintln!("dispatch: {:?}", c_opt);
+        eprintln!("oracle  : {:?}", c_gen);
+        let eq = |o: f64, g: f64| {
+            (o.is_infinite() && g.is_infinite() && o.is_sign_negative() == g.is_sign_negative())
+                || (o - g).abs() < 1e-9
+        };
+        for (i, (o, g)) in c_opt.iter().zip(c_gen.iter()).enumerate() {
+            assert!(eq(*o, *g), "with -inf: mismatch at idx {i}: {o} vs {g}");
+        }
     }
 }
