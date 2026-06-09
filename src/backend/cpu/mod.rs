@@ -1532,10 +1532,11 @@ mod tests {
         let cpu = Cpu;
         let (batch_size, m, k, n) = (3usize, 3, 4, 5);
         let a: Vec<f64> = (0..batch_size * m * k).map(|i| (i as f64) * 0.5).collect();
-        let b: Vec<f64> = (0..batch_size * k * n).map(|i| (i as f64) * 0.25 + 0.1).collect();
+        let b: Vec<f64> = (0..batch_size * k * n)
+            .map(|i| (i as f64) * 0.25 + 0.1)
+            .collect();
 
-        let c_batched =
-            cpu.gemm_batched_internal::<MaxPlus<f64>>(&a, batch_size, m, k, &b, n);
+        let c_batched = cpu.gemm_batched_internal::<MaxPlus<f64>>(&a, batch_size, m, k, &b, n);
 
         // Oracle: concatenated generic_gemm per batch.
         let mut c_ref = Vec::with_capacity(batch_size * m * n);

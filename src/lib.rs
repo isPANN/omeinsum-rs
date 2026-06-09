@@ -76,5 +76,5 @@ pub use tensor::{Tensor, TensorView};
 #[cfg(feature = "tropical")]
 pub use algebra::{MaxMul, MaxPlus, MinPlus};
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "cuda-tropical"))]
 pub use backend::Cuda;

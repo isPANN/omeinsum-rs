@@ -33,15 +33,27 @@
 //! export LD_LIBRARY_PATH=$CUTENSOR_PATH:$LD_LIBRARY_PATH
 //! ```
 
+// The CUDA backend stores scalars behind a generic `T: Scalar` but dispatches the
+// actual device work by `TypeId`, reinterpreting the (layout-identical) concrete
+// type via `transmute` inside each type-checked branch. That pattern appears
+// dozens of times here; the source/target types are evident from the enclosing
+// `TypeId` guard and the `let` binding, so the explicit-annotation lint is just
+// noise for this file.
+#![allow(clippy::missing_transmute_annotations)]
+
+#[cfg(feature = "cuda")]
 mod cutensor;
 mod storage;
 
 pub use storage::CudaStorage;
 
-use cudarc::driver::CudaDevice;
+use cudarc::driver::{CudaContext, CudaStream};
+#[cfg(feature = "cuda")]
 use cutensor::{contract, CacheKey, CutensorType, Handle, PlanCache, TensorDesc};
 use num_complex::Complex;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(feature = "cuda")]
+use std::sync::Mutex;
 
 use crate::algebra::{Algebra, Scalar};
 use crate::backend::traits::{Backend, BackendScalar, Storage};
@@ -180,6 +192,7 @@ impl Scalar for CudaComplex<f32> {}
 impl Scalar for CudaComplex<f64> {}
 
 // CutensorType implementations
+#[cfg(feature = "cuda")]
 impl CutensorType for CudaComplex<f32> {
     const DATA: cutensor::sys::cutensorDataType_t = cutensor::sys::cutensorDataType_t::C_32F;
     fn compute_desc() -> cutensor::sys::cutensorComputeDescriptor_t {
@@ -187,6 +200,7 @@ impl CutensorType for CudaComplex<f32> {
     }
 }
 
+#[cfg(feature = "cuda")]
 impl CutensorType for CudaComplex<f64> {
     const DATA: cutensor::sys::cutensorDataType_t = cutensor::sys::cutensorDataType_t::C_64F;
     fn compute_desc() -> cutensor::sys::cutensorComputeDescriptor_t {
@@ -212,8 +226,11 @@ impl<T> From<CudaComplex<T>> for Complex<T> {
 /// Wraps a CUDA device and provides methods for GPU memory management
 /// and tensor contractions via cuTENSOR.
 pub struct Cuda {
-    device: Arc<CudaDevice>,
+    ctx: Arc<CudaContext>,
+    stream: Arc<CudaStream>,
+    #[cfg(feature = "cuda")]
     handle: Mutex<Option<Handle>>,
+    #[cfg(feature = "cuda")]
     cache: Mutex<PlanCache>,
 }
 
@@ -225,11 +242,14 @@ unsafe impl Sync for Cuda {}
 
 impl Clone for Cuda {
     fn clone(&self) -> Self {
-        // Create a new Cuda instance sharing the same device
-        // but with fresh handle and cache (lazy initialization)
+        // Create a new Cuda instance sharing the same device/stream
+        // but with fresh handle and cache (lazy initialization).
         Self {
-            device: self.device.clone(),
+            ctx: self.ctx.clone(),
+            stream: self.stream.clone(),
+            #[cfg(feature = "cuda")]
             handle: Mutex::new(None),
+            #[cfg(feature = "cuda")]
             cache: Mutex::new(PlanCache::new(64)),
         }
     }
@@ -256,23 +276,33 @@ impl Cuda {
     /// # Arguments
     /// * `ordinal` - The device ordinal (0-indexed)
     pub fn on_device(ordinal: usize) -> Result<Self, CudaError> {
-        let device = CudaDevice::new(ordinal).map_err(|e| CudaError::Device(e.to_string()))?;
+        let ctx = CudaContext::new(ordinal).map_err(|e| CudaError::Device(e.to_string()))?;
+        let stream = ctx.default_stream();
         Ok(Self {
-            device,
+            ctx,
+            stream,
+            #[cfg(feature = "cuda")]
             handle: Mutex::new(None),
+            #[cfg(feature = "cuda")]
             cache: Mutex::new(PlanCache::new(64)),
         })
     }
 
-    /// Get a reference to the CUDA device.
-    pub fn device(&self) -> &Arc<CudaDevice> {
-        &self.device
+    /// Get a reference to the CUDA context.
+    pub fn context(&self) -> &Arc<CudaContext> {
+        &self.ctx
+    }
+
+    /// Get a reference to the CUDA stream used for transfers and kernel launches.
+    pub fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
     }
 
     /// Ensure the cuTENSOR handle is initialized and execute a function with it.
     ///
     /// This method acquires the handle lock and ensures the handle is initialized,
     /// then calls the provided function with access to the handle.
+    #[cfg(feature = "cuda")]
     fn with_handle<R>(
         &self,
         f: impl FnOnce(&Handle) -> Result<R, CudaError>,
@@ -280,7 +310,7 @@ impl Cuda {
         let mut h = self.handle.lock().unwrap();
         if h.is_none() {
             *h = Some(
-                Handle::new(self.device.clone())
+                Handle::new(self.stream.clone())
                     .map_err(|e| CudaError::Cutensor(format!("{}", e)))?,
             );
         }
@@ -307,6 +337,7 @@ impl Cuda {
     /// # Returns
     /// * `Ok(CudaStorage<T>)` containing the contraction result
     /// * `Err(CudaError)` if the contraction fails
+    #[cfg(feature = "cuda")]
     #[allow(clippy::too_many_arguments)]
     pub fn contract_cutensor<T>(
         &self,
@@ -332,7 +363,7 @@ impl Cuda {
         // Allocate output storage first (outside of locks)
         let len: usize = shape_c.iter().product();
         let mut c = self
-            .device
+            .stream
             .alloc_zeros::<T>(len)
             .map_err(|e| CudaError::Alloc(e.to_string()))?;
 
@@ -369,10 +400,12 @@ impl Cuda {
             Ok(())
         })?;
 
-        Ok(CudaStorage::new(c, self.device.clone()))
+        Ok(CudaStorage::new(c, self.stream.clone()))
     }
 
     /// Compute column-major strides for a given shape.
+    // Used by the cuTENSOR path and (Phase 2) the tropical executor.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     fn compute_strides(shape: &[usize]) -> Vec<usize> {
         let mut strides = Vec::with_capacity(shape.len());
         let mut stride = 1;
@@ -382,6 +415,403 @@ impl Cuda {
         }
         strides
     }
+
+    /// Tropical contraction on GPU via `tropical-gemm-cuda`.
+    ///
+    /// cuTENSOR has no tropical semiring, so max-plus / min-plus / max-mul
+    /// contractions are routed here. Reuses the backend-neutral
+    /// [`crate::backend::contract_plan`] planner to reduce the contraction to a
+    /// (batched) matmul, lays operands out in the canonical column-major
+    /// `[left, contracted, batch]` / `[contracted, right, batch]` layout, then
+    /// runs the tropical GEMM kernel on the **shared** device (one
+    /// `CudaContext::from_device`, no duplicate driver context).
+    ///
+    /// Layout note: unlike the CPU `try_tropical_gemm` (which feeds column-major
+    /// bytes to a *row-major* `tropical_matmul` and therefore swaps a↔b / m↔n),
+    /// `tropical-gemm-cuda`'s `GpuMatrix` + `tropical_gemm_gpu` are
+    /// **column-major** — the same order omeinsum uses — so operands are passed
+    /// straight through with no swap.
+    ///
+    /// Operand materialization (gather of strided views, trace reduction, and
+    /// the canonical permutation) currently runs on the host via a
+    /// download/upload roundtrip, matching the existing [`Cuda::copy_strided`]
+    /// path; a device-side permute is a later optimization (plan Phase 5).
+    #[cfg(feature = "cuda-tropical")]
+    #[allow(clippy::too_many_arguments)]
+    fn contract_tropical<A: Algebra>(
+        &self,
+        a: &CudaStorage<A::Scalar>,
+        shape_a: &[usize],
+        strides_a: &[usize],
+        modes_a: &[i32],
+        b: &CudaStorage<A::Scalar>,
+        shape_b: &[usize],
+        strides_b: &[usize],
+        modes_b: &[i32],
+        shape_c: &[usize],
+        modes_c: &[i32],
+    ) -> CudaStorage<A::Scalar>
+    where
+        A::Scalar: BackendScalar<Self>,
+    {
+        // Prepare canonical operands, run the (batched) GEMM, permute the result
+        // `[left, right, batch]` back to `modes_c`, and upload.
+        let (plan, a_canon, b_canon) = self.plan_tropical_operands::<A>(
+            a, shape_a, strides_a, modes_a, b, shape_b, strides_b, modes_b, modes_c,
+        );
+        let batch = plan.batch_size.max(1);
+        let c_canon = self.run_tropical_gemm::<A>(
+            &a_canon,
+            &b_canon,
+            batch,
+            plan.left_size,
+            plan.contract_size,
+            plan.right_size,
+        );
+        let c_final = permute_tropical_output(c_canon, &plan, shape_c, modes_c);
+        self.from_slice(&c_final)
+    }
+
+    /// Tropical forward contraction with argmax tracking (winner `k`-index per
+    /// output element), the GPU counterpart of the CPU
+    /// [`contract::contract_with_argmax`](crate::backend::cpu::contract).
+    ///
+    /// Shares the exact operand preparation of [`Cuda::contract_tropical`] — the
+    /// same trace reduction and the same canonical permutation (whose contracted
+    /// mode order comes straight from `classify_modes`, identical to the CPU
+    /// path) — so the emitted `argmax` linearizes the contracted modes in the
+    /// order [`crate::einsum::backward`] expects when it decodes the winner via
+    /// `linear_to_coords(k, contracted_shape)`. The argmax buffer is permuted
+    /// alongside the result (it has the same `[left, right, batch]` shape).
+    #[cfg(feature = "cuda-tropical")]
+    #[allow(clippy::too_many_arguments)]
+    fn contract_tropical_with_argmax<A: Algebra<Index = u32>>(
+        &self,
+        a: &CudaStorage<A::Scalar>,
+        shape_a: &[usize],
+        strides_a: &[usize],
+        modes_a: &[i32],
+        b: &CudaStorage<A::Scalar>,
+        shape_b: &[usize],
+        strides_b: &[usize],
+        modes_b: &[i32],
+        shape_c: &[usize],
+        modes_c: &[i32],
+    ) -> (CudaStorage<A::Scalar>, CudaStorage<u32>)
+    where
+        A::Scalar: BackendScalar<Self>,
+    {
+        let (plan, a_canon, b_canon) = self.plan_tropical_operands::<A>(
+            a, shape_a, strides_a, modes_a, b, shape_b, strides_b, modes_b, modes_c,
+        );
+        let batch = plan.batch_size.max(1);
+        let (c_canon, argmax_canon) = self.run_tropical_gemm_with_argmax::<A>(
+            &a_canon,
+            &b_canon,
+            batch,
+            plan.left_size,
+            plan.contract_size,
+            plan.right_size,
+        );
+        let c_final = permute_tropical_output(c_canon, &plan, shape_c, modes_c);
+        let argmax_final = permute_tropical_output(argmax_canon, &plan, shape_c, modes_c);
+        (self.from_slice(&c_final), self.from_slice(&argmax_final))
+    }
+
+    /// Download both operands, reduce any trace modes, and permute each into the
+    /// canonical column-major matmul layout (`A → [left, contracted, batch]`,
+    /// `B → [contracted, right, batch]`). Returns the re-planned
+    /// [`ContractionPlan`] (built on the trace-free operands) plus the two
+    /// canonical host buffers. Shared by the tropical forward and argmax paths.
+    #[cfg(feature = "cuda-tropical")]
+    #[allow(clippy::too_many_arguments)]
+    fn plan_tropical_operands<A: Algebra>(
+        &self,
+        a: &CudaStorage<A::Scalar>,
+        shape_a: &[usize],
+        strides_a: &[usize],
+        modes_a: &[i32],
+        b: &CudaStorage<A::Scalar>,
+        shape_b: &[usize],
+        strides_b: &[usize],
+        modes_b: &[i32],
+        modes_c: &[i32],
+    ) -> (
+        crate::backend::contract_plan::ContractionPlan,
+        Vec<A::Scalar>,
+        Vec<A::Scalar>,
+    ) {
+        use crate::backend::contract_plan::{
+            gather_contiguous, materialize_strided, plan_contraction, reduce_trace,
+        };
+        use crate::tensor::compute_contiguous_strides;
+
+        // 1. Download operands and gather any strided view into contiguous
+        //    column-major host buffers.
+        let a_contig = gather_contiguous::<A::Scalar>(&a.to_vec(), shape_a, strides_a);
+        let b_contig = gather_contiguous::<A::Scalar>(&b.to_vec(), shape_b, strides_b);
+
+        // 2. Reduce trace modes (single-operand modes absent from the output).
+        //    These cannot be handled by GEMM and must be summed via the semiring
+        //    add *before* the matmul.
+        let probe = plan_contraction(modes_a, shape_a, modes_b, shape_b, modes_c);
+        let (a_data, a_shape, a_modes) = if probe.left_trace.is_empty() {
+            (a_contig, shape_a.to_vec(), modes_a.to_vec())
+        } else {
+            reduce_trace::<A>(&a_contig, shape_a, modes_a, &probe.left_trace)
+        };
+        let (b_data, b_shape, b_modes) = if probe.right_trace.is_empty() {
+            (b_contig, shape_b.to_vec(), modes_b.to_vec())
+        } else {
+            reduce_trace::<A>(&b_contig, shape_b, modes_b, &probe.right_trace)
+        };
+
+        // 3. Re-plan on the (now trace-free) reduced operands and permute each
+        //    into the canonical matmul layout.
+        let plan = plan_contraction(&a_modes, &a_shape, &b_modes, &b_shape, modes_c);
+        let a_canon = materialize_strided::<A::Scalar>(
+            &a_data,
+            &a_shape,
+            &compute_contiguous_strides(&a_shape),
+            &plan.a_permutation(&a_modes),
+        );
+        let b_canon = materialize_strided::<A::Scalar>(
+            &b_data,
+            &b_shape,
+            &compute_contiguous_strides(&b_shape),
+            &plan.b_permutation(&b_modes),
+        );
+        (plan, a_canon, b_canon)
+    }
+
+    /// Dispatch a canonical column-major (batched) tropical GEMM to the concrete
+    /// `tropical-gemm-cuda` kernel for `A`'s semiring × scalar, sharing this
+    /// backend's CUDA device.
+    ///
+    /// `a` is `batch × (m × k)` and `b` is `batch × (k × n)`, both contiguous
+    /// column-major; the returned buffer is `batch × (m × n)` in the same order.
+    #[cfg(feature = "cuda-tropical")]
+    fn run_tropical_gemm<A: Algebra>(
+        &self,
+        a: &[A::Scalar],
+        b: &[A::Scalar],
+        batch: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Vec<A::Scalar> {
+        use crate::algebra::{MaxMul, MaxPlus, MinPlus};
+        use std::any::TypeId;
+        use tropical_gemm::{TropicalMaxMul, TropicalMaxPlus, TropicalMinPlus};
+
+        let tctx = tropical_gemm_cuda::CudaContext::from_device(self.ctx.clone())
+            .expect("failed to build tropical-gemm-cuda context from the shared CUDA device");
+
+        // The omeinsum algebra types (`A::Scalar` = f32/f64) and the tropical-gemm
+        // kernel scalar types share an identical `repr(transparent)` layout, so the
+        // slice/Vec transmutes below are byte-identity reinterpretations (same as
+        // the CPU `try_tropical_gemm`).
+        macro_rules! dispatch {
+            ($kernel:ty, $scalar:ty) => {{
+                let a_s: &[$scalar] = unsafe { std::mem::transmute(a) };
+                let b_s: &[$scalar] = unsafe { std::mem::transmute(b) };
+                let out = batched_tropical_gemm::<$kernel>(&tctx, a_s, b_s, batch, m, k, n);
+                unsafe { std::mem::transmute::<Vec<$scalar>, Vec<A::Scalar>>(out) }
+            }};
+        }
+
+        if TypeId::of::<A>() == TypeId::of::<MaxPlus<f32>>() {
+            dispatch!(TropicalMaxPlus<f32>, f32)
+        } else if TypeId::of::<A>() == TypeId::of::<MaxPlus<f64>>() {
+            dispatch!(TropicalMaxPlus<f64>, f64)
+        } else if TypeId::of::<A>() == TypeId::of::<MinPlus<f32>>() {
+            dispatch!(TropicalMinPlus<f32>, f32)
+        } else if TypeId::of::<A>() == TypeId::of::<MinPlus<f64>>() {
+            dispatch!(TropicalMinPlus<f64>, f64)
+        } else if TypeId::of::<A>() == TypeId::of::<MaxMul<f32>>() {
+            dispatch!(TropicalMaxMul<f32>, f32)
+        } else if TypeId::of::<A>() == TypeId::of::<MaxMul<f64>>() {
+            dispatch!(TropicalMaxMul<f64>, f64)
+        } else {
+            panic!(
+                "CUDA tropical contraction is only implemented for MaxPlus/MinPlus/MaxMul \
+                 over f32/f64; got algebra {:?}",
+                std::any::type_name::<A>()
+            );
+        }
+    }
+
+    /// Argmax-tracking counterpart of [`Cuda::run_tropical_gemm`]: dispatches a
+    /// canonical column-major (batched) tropical GEMM to the concrete
+    /// `tropical-gemm-cuda` *argmax* kernel for `A`'s semiring × scalar, returning
+    /// both the result buffer and the winner `k`-index per output element (both
+    /// `batch × (m × n)` column-major).
+    #[cfg(feature = "cuda-tropical")]
+    fn run_tropical_gemm_with_argmax<A: Algebra>(
+        &self,
+        a: &[A::Scalar],
+        b: &[A::Scalar],
+        batch: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> (Vec<A::Scalar>, Vec<u32>) {
+        use crate::algebra::{MaxMul, MaxPlus, MinPlus};
+        use std::any::TypeId;
+        use tropical_gemm::{TropicalMaxMul, TropicalMaxPlus, TropicalMinPlus};
+
+        let tctx = tropical_gemm_cuda::CudaContext::from_device(self.ctx.clone())
+            .expect("failed to build tropical-gemm-cuda context from the shared CUDA device");
+
+        // Same `repr(transparent)` byte-identity transmutes as `run_tropical_gemm`;
+        // the argmax buffer is `u32` on both sides, so it needs no reinterpretation.
+        macro_rules! dispatch {
+            ($kernel:ty, $scalar:ty) => {{
+                let a_s: &[$scalar] = unsafe { std::mem::transmute(a) };
+                let b_s: &[$scalar] = unsafe { std::mem::transmute(b) };
+                let (out, argmax) =
+                    batched_tropical_gemm_with_argmax::<$kernel>(&tctx, a_s, b_s, batch, m, k, n);
+                (
+                    unsafe { std::mem::transmute::<Vec<$scalar>, Vec<A::Scalar>>(out) },
+                    argmax,
+                )
+            }};
+        }
+
+        if TypeId::of::<A>() == TypeId::of::<MaxPlus<f32>>() {
+            dispatch!(TropicalMaxPlus<f32>, f32)
+        } else if TypeId::of::<A>() == TypeId::of::<MaxPlus<f64>>() {
+            dispatch!(TropicalMaxPlus<f64>, f64)
+        } else if TypeId::of::<A>() == TypeId::of::<MinPlus<f32>>() {
+            dispatch!(TropicalMinPlus<f32>, f32)
+        } else if TypeId::of::<A>() == TypeId::of::<MinPlus<f64>>() {
+            dispatch!(TropicalMinPlus<f64>, f64)
+        } else if TypeId::of::<A>() == TypeId::of::<MaxMul<f32>>() {
+            dispatch!(TropicalMaxMul<f32>, f32)
+        } else if TypeId::of::<A>() == TypeId::of::<MaxMul<f64>>() {
+            dispatch!(TropicalMaxMul<f64>, f64)
+        } else {
+            panic!(
+                "CUDA tropical argmax contraction is only implemented for \
+                 MaxPlus/MinPlus/MaxMul over f32/f64; got algebra {:?}",
+                std::any::type_name::<A>()
+            );
+        }
+    }
+}
+
+/// Permute a GEMM output buffer (column-major `[left, right, batch]`) back to the
+/// requested `modes_c` order. Used for both the result and the argmax buffers
+/// (which share the output shape), so it is generic over the element type.
+#[cfg(feature = "cuda-tropical")]
+fn permute_tropical_output<T: Copy + Default>(
+    canonical: Vec<T>,
+    plan: &crate::backend::contract_plan::ContractionPlan,
+    shape_c: &[usize],
+    modes_c: &[i32],
+) -> Vec<T> {
+    use crate::backend::contract_plan::{materialize_strided, mode_position};
+    use crate::tensor::compute_contiguous_strides;
+
+    match &plan.output_perm {
+        None => canonical,
+        Some(out_perm) => {
+            let current_order: Vec<i32> = plan
+                .left_modes
+                .iter()
+                .chain(plan.right_modes.iter())
+                .chain(plan.batch_modes.iter())
+                .copied()
+                .collect();
+            let c_shape_current: Vec<usize> = current_order
+                .iter()
+                .map(|&m| shape_c[mode_position(modes_c, m)])
+                .collect();
+            materialize_strided::<T>(
+                &canonical,
+                &c_shape_current,
+                &compute_contiguous_strides(&c_shape_current),
+                out_perm,
+            )
+        }
+    }
+}
+
+/// Run a canonical column-major (batched) tropical GEMM on the shared context,
+/// looping per batch slice. `K` selects the concrete semiring × scalar kernel.
+#[cfg(feature = "cuda-tropical")]
+fn batched_tropical_gemm<K>(
+    ctx: &tropical_gemm_cuda::CudaContext,
+    a: &[K::Scalar],
+    b: &[K::Scalar],
+    batch: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Vec<K::Scalar>
+where
+    K: tropical_gemm_cuda::CudaKernel,
+    K::Scalar: cudarc::driver::DeviceRepr + Default + Clone + cudarc::driver::ValidAsZeroBits,
+{
+    use tropical_gemm_cuda::{tropical_gemm_gpu, GpuMatrix};
+
+    let (a_stride, b_stride, c_stride) = (m * k, k * n, m * n);
+    let mut out = vec![K::Scalar::default(); batch * c_stride];
+
+    for i in 0..batch {
+        let a_gpu = GpuMatrix::from_host(ctx, &a[i * a_stride..(i + 1) * a_stride], m, k)
+            .expect("upload tropical GEMM operand A");
+        let b_gpu = GpuMatrix::from_host(ctx, &b[i * b_stride..(i + 1) * b_stride], k, n)
+            .expect("upload tropical GEMM operand B");
+        let mut c_gpu = GpuMatrix::alloc(ctx, m, n).expect("alloc tropical GEMM output");
+        tropical_gemm_gpu::<K>(ctx, &a_gpu, &b_gpu, &mut c_gpu).expect("tropical GEMM kernel");
+        let c_host = c_gpu.to_host(ctx).expect("download tropical GEMM output");
+        out[i * c_stride..(i + 1) * c_stride].copy_from_slice(&c_host);
+    }
+    out
+}
+
+/// Argmax-tracking counterpart of [`batched_tropical_gemm`]: runs the per-batch
+/// tropical GEMM with winner tracking, returning the result and the argmax
+/// `k`-indices (both `batch × (m × n)` column-major).
+#[cfg(feature = "cuda-tropical")]
+fn batched_tropical_gemm_with_argmax<K>(
+    ctx: &tropical_gemm_cuda::CudaContext,
+    a: &[K::Scalar],
+    b: &[K::Scalar],
+    batch: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> (Vec<K::Scalar>, Vec<u32>)
+where
+    K: tropical_gemm_cuda::CudaKernelWithArgmax,
+    K::Scalar: cudarc::driver::DeviceRepr + Default + Clone + cudarc::driver::ValidAsZeroBits,
+{
+    use tropical_gemm_cuda::{tropical_gemm_gpu_with_argmax, GpuMatrix, GpuMatrixWithArgmax};
+
+    let (a_stride, b_stride, c_stride) = (m * k, k * n, m * n);
+    let mut out = vec![K::Scalar::default(); batch * c_stride];
+    let mut argmax = vec![0u32; batch * c_stride];
+
+    for i in 0..batch {
+        let a_gpu = GpuMatrix::from_host(ctx, &a[i * a_stride..(i + 1) * a_stride], m, k)
+            .expect("upload tropical GEMM operand A");
+        let b_gpu = GpuMatrix::from_host(ctx, &b[i * b_stride..(i + 1) * b_stride], k, n)
+            .expect("upload tropical GEMM operand B");
+        let mut c_gpu = GpuMatrixWithArgmax::alloc(ctx, m, n).expect("alloc tropical GEMM output");
+        tropical_gemm_gpu_with_argmax::<K>(ctx, &a_gpu, &b_gpu, &mut c_gpu)
+            .expect("tropical GEMM argmax kernel");
+        let c_host = c_gpu
+            .matrix_to_host(ctx)
+            .expect("download tropical GEMM output");
+        let argmax_host = c_gpu
+            .argmax_to_host(ctx)
+            .expect("download tropical GEMM argmax");
+        out[i * c_stride..(i + 1) * c_stride].copy_from_slice(&c_host);
+        argmax[i * c_stride..(i + 1) * c_stride].copy_from_slice(&argmax_host);
+    }
+    (out, argmax)
 }
 
 /// Errors that can occur during CUDA operations.
@@ -408,28 +838,6 @@ impl std::fmt::Display for CudaError {
 impl std::error::Error for CudaError {}
 
 // ============================================================================
-// Marker trait for CUDA-compatible scalar types
-// ============================================================================
-
-/// Marker trait for scalar types that can be used with CUDA.
-///
-/// This unifies the requirements of `Scalar` (for the type system) and
-/// cudarc traits (for GPU operations). Types implementing this trait can
-/// be used with `CudaStorage` and CUDA tensor operations.
-pub trait CudaScalar:
-    Scalar
-    + cudarc::driver::DeviceRepr
-    + cudarc::driver::ValidAsZeroBits
-    + CutensorType
-    + num_traits::One
-    + num_traits::Zero
-{
-}
-
-impl CudaScalar for f32 {}
-impl CudaScalar for f64 {}
-
-// ============================================================================
 // Storage implementation for CudaStorage
 // ============================================================================
 
@@ -439,7 +847,6 @@ impl CudaScalar for f64 {}
 
 impl<T: Scalar> Storage<T> for CudaStorage<T> {
     fn len(&self) -> usize {
-        use cudarc::driver::DeviceSlice;
         self.slice().len()
     }
 
@@ -457,22 +864,22 @@ impl<T: Scalar> Storage<T> for CudaStorage<T> {
         if TypeId::of::<T>() == TypeId::of::<f32>() {
             let buf_f32: Vec<f32> = unsafe { std::mem::transmute(buf) };
             let new_slice = self
-                .device()
-                .htod_sync_copy(&buf_f32)
+                .stream()
+                .clone_htod(&buf_f32)
                 .expect("Failed to upload");
             *self = CudaStorage::new(
                 unsafe { std::mem::transmute(new_slice) },
-                self.device().clone(),
+                self.stream().clone(),
             );
         } else if TypeId::of::<T>() == TypeId::of::<f64>() {
             let buf_f64: Vec<f64> = unsafe { std::mem::transmute(buf) };
             let new_slice = self
-                .device()
-                .htod_sync_copy(&buf_f64)
+                .stream()
+                .clone_htod(&buf_f64)
                 .expect("Failed to upload");
             *self = CudaStorage::new(
                 unsafe { std::mem::transmute(new_slice) },
-                self.device().clone(),
+                self.stream().clone(),
             );
         } else {
             panic!(
@@ -488,40 +895,40 @@ impl<T: Scalar> Storage<T> for CudaStorage<T> {
             let slice_f32: &cudarc::driver::CudaSlice<f32> =
                 unsafe { std::mem::transmute(self.slice()) };
             let result = self
-                .device()
-                .dtoh_sync_copy(slice_f32)
+                .stream()
+                .clone_dtoh(slice_f32)
                 .expect("Failed to download");
             unsafe { std::mem::transmute(result) }
         } else if TypeId::of::<T>() == TypeId::of::<f64>() {
             let slice_f64: &cudarc::driver::CudaSlice<f64> =
                 unsafe { std::mem::transmute(self.slice()) };
             let result = self
-                .device()
-                .dtoh_sync_copy(slice_f64)
+                .stream()
+                .clone_dtoh(slice_f64)
                 .expect("Failed to download");
             unsafe { std::mem::transmute(result) }
         } else if TypeId::of::<T>() == TypeId::of::<u32>() {
             let slice_u32: &cudarc::driver::CudaSlice<u32> =
                 unsafe { std::mem::transmute(self.slice()) };
             let result = self
-                .device()
-                .dtoh_sync_copy(slice_u32)
+                .stream()
+                .clone_dtoh(slice_u32)
                 .expect("Failed to download");
             unsafe { std::mem::transmute(result) }
         } else if TypeId::of::<T>() == TypeId::of::<CudaComplex<f32>>() {
             let slice_c32: &cudarc::driver::CudaSlice<CudaComplex<f32>> =
                 unsafe { std::mem::transmute(self.slice()) };
             let result = self
-                .device()
-                .dtoh_sync_copy(slice_c32)
+                .stream()
+                .clone_dtoh(slice_c32)
                 .expect("Failed to download");
             unsafe { std::mem::transmute(result) }
         } else if TypeId::of::<T>() == TypeId::of::<CudaComplex<f64>>() {
             let slice_c64: &cudarc::driver::CudaSlice<CudaComplex<f64>> =
                 unsafe { std::mem::transmute(self.slice()) };
             let result = self
-                .device()
-                .dtoh_sync_copy(slice_c64)
+                .stream()
+                .clone_dtoh(slice_c64)
                 .expect("Failed to download");
             unsafe { std::mem::transmute(result) }
         } else {
@@ -546,53 +953,38 @@ impl<T: Scalar> Clone for CudaStorage<T> {
         use std::any::TypeId;
         if TypeId::of::<T>() == TypeId::of::<f32>() {
             let data: Vec<f32> = unsafe { std::mem::transmute(self.to_vec()) };
-            let new_slice = self
-                .device()
-                .htod_sync_copy(&data)
-                .expect("Failed to clone");
+            let new_slice = self.stream().clone_htod(&data).expect("Failed to clone");
             CudaStorage::new(
                 unsafe { std::mem::transmute(new_slice) },
-                self.device().clone(),
+                self.stream().clone(),
             )
         } else if TypeId::of::<T>() == TypeId::of::<f64>() {
             let data: Vec<f64> = unsafe { std::mem::transmute(self.to_vec()) };
-            let new_slice = self
-                .device()
-                .htod_sync_copy(&data)
-                .expect("Failed to clone");
+            let new_slice = self.stream().clone_htod(&data).expect("Failed to clone");
             CudaStorage::new(
                 unsafe { std::mem::transmute(new_slice) },
-                self.device().clone(),
+                self.stream().clone(),
             )
         } else if TypeId::of::<T>() == TypeId::of::<u32>() {
             let data: Vec<u32> = unsafe { std::mem::transmute(self.to_vec()) };
-            let new_slice = self
-                .device()
-                .htod_sync_copy(&data)
-                .expect("Failed to clone");
+            let new_slice = self.stream().clone_htod(&data).expect("Failed to clone");
             CudaStorage::new(
                 unsafe { std::mem::transmute(new_slice) },
-                self.device().clone(),
+                self.stream().clone(),
             )
         } else if TypeId::of::<T>() == TypeId::of::<CudaComplex<f32>>() {
             let data: Vec<CudaComplex<f32>> = unsafe { std::mem::transmute(self.to_vec()) };
-            let new_slice = self
-                .device()
-                .htod_sync_copy(&data)
-                .expect("Failed to clone");
+            let new_slice = self.stream().clone_htod(&data).expect("Failed to clone");
             CudaStorage::new(
                 unsafe { std::mem::transmute(new_slice) },
-                self.device().clone(),
+                self.stream().clone(),
             )
         } else if TypeId::of::<T>() == TypeId::of::<CudaComplex<f64>>() {
             let data: Vec<CudaComplex<f64>> = unsafe { std::mem::transmute(self.to_vec()) };
-            let new_slice = self
-                .device()
-                .htod_sync_copy(&data)
-                .expect("Failed to clone");
+            let new_slice = self.stream().clone_htod(&data).expect("Failed to clone");
             CudaStorage::new(
                 unsafe { std::mem::transmute(new_slice) },
-                self.device().clone(),
+                self.stream().clone(),
             )
         } else {
             panic!(
@@ -615,7 +1007,7 @@ impl Backend for Cuda {
     }
 
     fn synchronize(&self) {
-        self.device
+        self.stream
             .synchronize()
             .expect("Failed to synchronize CUDA device");
     }
@@ -624,34 +1016,34 @@ impl Backend for Cuda {
         use std::any::TypeId;
         if TypeId::of::<T>() == TypeId::of::<f32>() {
             let slice = self
-                .device
+                .stream
                 .alloc_zeros::<f32>(len)
                 .expect("Failed to allocate");
-            CudaStorage::new(unsafe { std::mem::transmute(slice) }, self.device.clone())
+            CudaStorage::new(unsafe { std::mem::transmute(slice) }, self.stream.clone())
         } else if TypeId::of::<T>() == TypeId::of::<f64>() {
             let slice = self
-                .device
+                .stream
                 .alloc_zeros::<f64>(len)
                 .expect("Failed to allocate");
-            CudaStorage::new(unsafe { std::mem::transmute(slice) }, self.device.clone())
+            CudaStorage::new(unsafe { std::mem::transmute(slice) }, self.stream.clone())
         } else if TypeId::of::<T>() == TypeId::of::<u32>() {
             let slice = self
-                .device
+                .stream
                 .alloc_zeros::<u32>(len)
                 .expect("Failed to allocate");
-            CudaStorage::new(unsafe { std::mem::transmute(slice) }, self.device.clone())
+            CudaStorage::new(unsafe { std::mem::transmute(slice) }, self.stream.clone())
         } else if TypeId::of::<T>() == TypeId::of::<CudaComplex<f32>>() {
             let slice = self
-                .device
+                .stream
                 .alloc_zeros::<CudaComplex<f32>>(len)
                 .expect("Failed to allocate");
-            CudaStorage::new(unsafe { std::mem::transmute(slice) }, self.device.clone())
+            CudaStorage::new(unsafe { std::mem::transmute(slice) }, self.stream.clone())
         } else if TypeId::of::<T>() == TypeId::of::<CudaComplex<f64>>() {
             let slice = self
-                .device
+                .stream
                 .alloc_zeros::<CudaComplex<f64>>(len)
                 .expect("Failed to allocate");
-            CudaStorage::new(unsafe { std::mem::transmute(slice) }, self.device.clone())
+            CudaStorage::new(unsafe { std::mem::transmute(slice) }, self.stream.clone())
         } else {
             panic!(
                 "CUDA alloc not supported for type {:?}",
@@ -664,39 +1056,24 @@ impl Backend for Cuda {
         use std::any::TypeId;
         if TypeId::of::<T>() == TypeId::of::<f32>() {
             let data_f32: &[f32] = unsafe { std::mem::transmute(data) };
-            let slice = self
-                .device
-                .htod_sync_copy(data_f32)
-                .expect("Failed to copy");
-            CudaStorage::new(unsafe { std::mem::transmute(slice) }, self.device.clone())
+            let slice = self.stream.clone_htod(data_f32).expect("Failed to copy");
+            CudaStorage::new(unsafe { std::mem::transmute(slice) }, self.stream.clone())
         } else if TypeId::of::<T>() == TypeId::of::<f64>() {
             let data_f64: &[f64] = unsafe { std::mem::transmute(data) };
-            let slice = self
-                .device
-                .htod_sync_copy(data_f64)
-                .expect("Failed to copy");
-            CudaStorage::new(unsafe { std::mem::transmute(slice) }, self.device.clone())
+            let slice = self.stream.clone_htod(data_f64).expect("Failed to copy");
+            CudaStorage::new(unsafe { std::mem::transmute(slice) }, self.stream.clone())
         } else if TypeId::of::<T>() == TypeId::of::<u32>() {
             let data_u32: &[u32] = unsafe { std::mem::transmute(data) };
-            let slice = self
-                .device
-                .htod_sync_copy(data_u32)
-                .expect("Failed to copy");
-            CudaStorage::new(unsafe { std::mem::transmute(slice) }, self.device.clone())
+            let slice = self.stream.clone_htod(data_u32).expect("Failed to copy");
+            CudaStorage::new(unsafe { std::mem::transmute(slice) }, self.stream.clone())
         } else if TypeId::of::<T>() == TypeId::of::<CudaComplex<f32>>() {
             let data_c32: &[CudaComplex<f32>] = unsafe { std::mem::transmute(data) };
-            let slice = self
-                .device
-                .htod_sync_copy(data_c32)
-                .expect("Failed to copy");
-            CudaStorage::new(unsafe { std::mem::transmute(slice) }, self.device.clone())
+            let slice = self.stream.clone_htod(data_c32).expect("Failed to copy");
+            CudaStorage::new(unsafe { std::mem::transmute(slice) }, self.stream.clone())
         } else if TypeId::of::<T>() == TypeId::of::<CudaComplex<f64>>() {
             let data_c64: &[CudaComplex<f64>] = unsafe { std::mem::transmute(data) };
-            let slice = self
-                .device
-                .htod_sync_copy(data_c64)
-                .expect("Failed to copy");
-            CudaStorage::new(unsafe { std::mem::transmute(slice) }, self.device.clone())
+            let slice = self.stream.clone_htod(data_c64).expect("Failed to copy");
+            CudaStorage::new(unsafe { std::mem::transmute(slice) }, self.stream.clone())
         } else {
             panic!(
                 "CUDA from_slice not supported for type {:?}",
@@ -760,95 +1137,141 @@ impl Backend for Cuda {
     where
         A::Scalar: BackendScalar<Self>,
     {
-        // Compute output strides (column-major)
-        let strides_c = Self::compute_strides(shape_c);
+        // Tropical algebras (max-plus / min-plus / max-mul) have no cuTENSOR
+        // semiring; route them to the tropical-gemm-cuda executor.
+        //
+        // Routing invariant: `needs_argmax()` is true for *exactly* the algebras
+        // that have a tropical-gemm-cuda kernel (the idempotent semirings whose
+        // backward pass needs argmax — MaxPlus/MinPlus/MaxMul). `contract_tropical`
+        // → `run_tropical_gemm` therefore covers every algebra that reaches this
+        // branch. If a future algebra returns `needs_argmax() == true` without a
+        // matching GPU kernel, it would hit the `panic!` in `run_tropical_gemm`;
+        // add its kernel (or a dedicated routing predicate) when that happens.
+        #[cfg(feature = "cuda-tropical")]
+        if A::needs_argmax() {
+            return self.contract_tropical::<A>(
+                a, shape_a, strides_a, modes_a, b, shape_b, strides_b, modes_b, shape_c, modes_c,
+            );
+        }
 
-        // Dispatch based on scalar type using type ID
-        use std::any::TypeId;
+        // Standard algebras use cuTENSOR.
+        #[cfg(feature = "cuda")]
+        {
+            // Compute output strides (column-major)
+            let strides_c = Self::compute_strides(shape_c);
 
-        if TypeId::of::<A::Scalar>() == TypeId::of::<f32>() {
-            // SAFETY: We've verified the type is f32
-            let a_f32: &CudaStorage<f32> = unsafe { std::mem::transmute(a) };
-            let b_f32: &CudaStorage<f32> = unsafe { std::mem::transmute(b) };
+            // Dispatch based on scalar type using type ID
+            use std::any::TypeId;
 
-            let result = self
-                .contract_cutensor(
-                    a_f32, shape_a, strides_a, modes_a, b_f32, shape_b, strides_b, modes_b,
-                    shape_c, &strides_c, modes_c,
-                )
-                .expect("cuTENSOR contraction failed");
+            if TypeId::of::<A::Scalar>() == TypeId::of::<f32>() {
+                // SAFETY: We've verified the type is f32
+                let a_f32: &CudaStorage<f32> = unsafe { std::mem::transmute(a) };
+                let b_f32: &CudaStorage<f32> = unsafe { std::mem::transmute(b) };
 
-            unsafe { std::mem::transmute(result) }
-        } else if TypeId::of::<A::Scalar>() == TypeId::of::<f64>() {
-            // SAFETY: We've verified the type is f64
-            let a_f64: &CudaStorage<f64> = unsafe { std::mem::transmute(a) };
-            let b_f64: &CudaStorage<f64> = unsafe { std::mem::transmute(b) };
+                let result = self
+                    .contract_cutensor(
+                        a_f32, shape_a, strides_a, modes_a, b_f32, shape_b, strides_b, modes_b,
+                        shape_c, &strides_c, modes_c,
+                    )
+                    .expect("cuTENSOR contraction failed");
 
-            let result = self
-                .contract_cutensor(
-                    a_f64, shape_a, strides_a, modes_a, b_f64, shape_b, strides_b, modes_b,
-                    shape_c, &strides_c, modes_c,
-                )
-                .expect("cuTENSOR contraction failed");
+                unsafe { std::mem::transmute(result) }
+            } else if TypeId::of::<A::Scalar>() == TypeId::of::<f64>() {
+                // SAFETY: We've verified the type is f64
+                let a_f64: &CudaStorage<f64> = unsafe { std::mem::transmute(a) };
+                let b_f64: &CudaStorage<f64> = unsafe { std::mem::transmute(b) };
 
-            unsafe { std::mem::transmute(result) }
-        } else if TypeId::of::<A::Scalar>() == TypeId::of::<CudaComplex<f32>>() {
-            // SAFETY: We've verified the type is CudaComplex<f32>
-            let a_c32: &CudaStorage<CudaComplex<f32>> = unsafe { std::mem::transmute(a) };
-            let b_c32: &CudaStorage<CudaComplex<f32>> = unsafe { std::mem::transmute(b) };
+                let result = self
+                    .contract_cutensor(
+                        a_f64, shape_a, strides_a, modes_a, b_f64, shape_b, strides_b, modes_b,
+                        shape_c, &strides_c, modes_c,
+                    )
+                    .expect("cuTENSOR contraction failed");
 
-            let result = self
-                .contract_cutensor(
-                    a_c32, shape_a, strides_a, modes_a, b_c32, shape_b, strides_b, modes_b,
-                    shape_c, &strides_c, modes_c,
-                )
-                .expect("cuTENSOR contraction failed");
+                unsafe { std::mem::transmute(result) }
+            } else if TypeId::of::<A::Scalar>() == TypeId::of::<CudaComplex<f32>>() {
+                // SAFETY: We've verified the type is CudaComplex<f32>
+                let a_c32: &CudaStorage<CudaComplex<f32>> = unsafe { std::mem::transmute(a) };
+                let b_c32: &CudaStorage<CudaComplex<f32>> = unsafe { std::mem::transmute(b) };
 
-            unsafe { std::mem::transmute(result) }
-        } else if TypeId::of::<A::Scalar>() == TypeId::of::<CudaComplex<f64>>() {
-            // SAFETY: We've verified the type is CudaComplex<f64>
-            let a_c64: &CudaStorage<CudaComplex<f64>> = unsafe { std::mem::transmute(a) };
-            let b_c64: &CudaStorage<CudaComplex<f64>> = unsafe { std::mem::transmute(b) };
+                let result = self
+                    .contract_cutensor(
+                        a_c32, shape_a, strides_a, modes_a, b_c32, shape_b, strides_b, modes_b,
+                        shape_c, &strides_c, modes_c,
+                    )
+                    .expect("cuTENSOR contraction failed");
 
-            let result = self
-                .contract_cutensor(
-                    a_c64, shape_a, strides_a, modes_a, b_c64, shape_b, strides_b, modes_b,
-                    shape_c, &strides_c, modes_c,
-                )
-                .expect("cuTENSOR contraction failed");
+                unsafe { std::mem::transmute(result) }
+            } else if TypeId::of::<A::Scalar>() == TypeId::of::<CudaComplex<f64>>() {
+                // SAFETY: We've verified the type is CudaComplex<f64>
+                let a_c64: &CudaStorage<CudaComplex<f64>> = unsafe { std::mem::transmute(a) };
+                let b_c64: &CudaStorage<CudaComplex<f64>> = unsafe { std::mem::transmute(b) };
 
-            unsafe { std::mem::transmute(result) }
-        } else {
+                let result = self
+                    .contract_cutensor(
+                        a_c64, shape_a, strides_a, modes_a, b_c64, shape_b, strides_b, modes_b,
+                        shape_c, &strides_c, modes_c,
+                    )
+                    .expect("cuTENSOR contraction failed");
+
+                unsafe { std::mem::transmute(result) }
+            } else {
+                panic!(
+                    "CUDA backend only supports f32, f64, CudaComplex<f32>, and \
+                     CudaComplex<f64> for contractions. Got type: {:?}",
+                    std::any::type_name::<A::Scalar>()
+                );
+            }
+        }
+
+        // No cuTENSOR available: only the tropical path (handled above) is supported.
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (
+                a, shape_a, strides_a, modes_a, b, shape_b, strides_b, modes_b, shape_c, modes_c,
+            );
             panic!(
-                "CUDA backend only supports f32, f64, CudaComplex<f32>, and \
-                 CudaComplex<f64> for contractions. Got type: {:?}",
-                std::any::type_name::<A::Scalar>()
+                "Standard-algebra contractions on the CUDA backend require the `cuda` \
+                 (cuTENSOR) feature; `cuda-tropical` only provides tropical contractions."
             );
         }
     }
 
     fn contract_with_argmax<A: Algebra<Index = u32>>(
         &self,
-        _a: &CudaStorage<A::Scalar>,
-        _shape_a: &[usize],
-        _strides_a: &[usize],
-        _modes_a: &[i32],
-        _b: &CudaStorage<A::Scalar>,
-        _shape_b: &[usize],
-        _strides_b: &[usize],
-        _modes_b: &[i32],
-        _shape_c: &[usize],
-        _modes_c: &[i32],
+        a: &CudaStorage<A::Scalar>,
+        shape_a: &[usize],
+        strides_a: &[usize],
+        modes_a: &[i32],
+        b: &CudaStorage<A::Scalar>,
+        shape_b: &[usize],
+        strides_b: &[usize],
+        modes_b: &[i32],
+        shape_c: &[usize],
+        modes_c: &[i32],
     ) -> (CudaStorage<A::Scalar>, CudaStorage<u32>)
     where
         A::Scalar: BackendScalar<Self>,
     {
-        // cuTENSOR does not support argmax tracking.
-        // This would require a custom CUDA kernel.
+        // Argmax tracking is a tropical-only concern (`needs_argmax()` ⟺ a
+        // tropical-gemm-cuda kernel exists); route it through the tropical-gemm
+        // argmax executor. cuTENSOR provides no argmax, so standard algebras —
+        // which never set `needs_argmax()` and so never reach this method — are
+        // not supported here.
+        #[cfg(feature = "cuda-tropical")]
+        if A::needs_argmax() {
+            return self.contract_tropical_with_argmax::<A>(
+                a, shape_a, strides_a, modes_a, b, shape_b, strides_b, modes_b, shape_c, modes_c,
+            );
+        }
+
+        let _ = (
+            a, shape_a, strides_a, modes_a, b, shape_b, strides_b, modes_b, shape_c, modes_c,
+        );
         panic!(
-            "CUDA backend does not support contract_with_argmax. \
-             cuTENSOR does not provide argmax tracking. \
-             A custom kernel would be needed for tropical backpropagation on GPU."
+            "CUDA contract_with_argmax is only supported for tropical algebras \
+             (MaxPlus/MinPlus/MaxMul) via the `cuda-tropical` feature; cuTENSOR \
+             does not provide argmax tracking."
         );
     }
 }

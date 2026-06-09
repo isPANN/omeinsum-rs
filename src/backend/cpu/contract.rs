@@ -2,81 +2,9 @@
 
 use std::collections::HashSet;
 
-/// Classify modes into batch, left-only, right-only, and contracted.
-///
-/// - batch: in both A and B, and in output C
-/// - left: only in A (free indices from A)
-/// - right: only in B (free indices from B)
-/// - contracted: in both A and B, but NOT in output C
-pub(super) fn classify_modes(
-    modes_a: &[i32],
-    modes_b: &[i32],
-    modes_c: &[i32],
-) -> (Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>) {
-    let a_set: HashSet<i32> = modes_a.iter().copied().collect();
-    let b_set: HashSet<i32> = modes_b.iter().copied().collect();
-    let c_set: HashSet<i32> = modes_c.iter().copied().collect();
-
-    let mut batch = Vec::new();
-    let mut left = Vec::new();
-    let mut contracted = Vec::new();
-
-    for &m in modes_a {
-        if b_set.contains(&m) && c_set.contains(&m) {
-            if !batch.contains(&m) {
-                batch.push(m);
-            }
-        } else if b_set.contains(&m) && !c_set.contains(&m) {
-            if !contracted.contains(&m) {
-                contracted.push(m);
-            }
-        } else if !left.contains(&m) {
-            left.push(m);
-        }
-    }
-
-    let right: Vec<i32> = modes_b
-        .iter()
-        .filter(|m| !a_set.contains(m))
-        .copied()
-        .collect();
-
-    (batch, left, right, contracted)
-}
-
-/// Find the position of a mode in a modes array.
-pub(super) fn mode_position(modes: &[i32], mode: i32) -> usize {
-    modes
-        .iter()
-        .position(|&m| m == mode)
-        .expect("mode not found")
-}
-
-/// Compute the product of dimensions for given modes.
-pub(super) fn product_of_dims(modes: &[i32], all_modes: &[i32], shape: &[usize]) -> usize {
-    modes
-        .iter()
-        .map(|&m| shape[mode_position(all_modes, m)])
-        .product::<usize>()
-        .max(1)
-}
-
-/// Compute permutation to reorder modes to [first..., second..., third...].
-pub(super) fn compute_permutation(
-    current: &[i32],
-    first: &[i32],
-    second: &[i32],
-    third: &[i32],
-) -> Vec<usize> {
-    let target: Vec<i32> = first
-        .iter()
-        .chain(second.iter())
-        .chain(third.iter())
-        .copied()
-        .collect();
-
-    target.iter().map(|m| mode_position(current, *m)).collect()
-}
+use crate::backend::contract_plan::{
+    classify_modes, compute_permutation, mode_position, product_of_dims, reduce_trace,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MaterializationPlan {
@@ -302,65 +230,8 @@ use crate::algebra::Algebra;
 use crate::backend::Cpu;
 use crate::tensor::compute_contiguous_strides;
 
-/// Sum (reduce) over specified modes in contiguous tensor data, removing those dimensions.
-///
-/// Uses `A::add` for accumulation so it works correctly with all algebras
-/// (standard addition for `Standard`, max for `MaxPlus`, etc.).
-fn reduce_trace_modes<A: Algebra>(
-    data: &[A::Scalar],
-    shape: &[usize],
-    all_modes: &[i32],
-    trace_modes: &[i32],
-) -> (Vec<A::Scalar>, Vec<usize>, Vec<i32>)
-where
-    A::Scalar: crate::algebra::Scalar,
-{
-    if trace_modes.is_empty() {
-        return (data.to_vec(), shape.to_vec(), all_modes.to_vec());
-    }
-
-    let trace_positions: HashSet<usize> = trace_modes
-        .iter()
-        .map(|m| mode_position(all_modes, *m))
-        .collect();
-
-    // New shape and modes without the trace dimensions
-    let new_shape: Vec<usize> = (0..shape.len())
-        .filter(|i| !trace_positions.contains(i))
-        .map(|i| shape[i])
-        .collect();
-    let new_modes: Vec<i32> = (0..all_modes.len())
-        .filter(|i| !trace_positions.contains(i))
-        .map(|i| all_modes[i])
-        .collect();
-
-    let new_size = new_shape.iter().product::<usize>().max(1);
-    let mut result: Vec<A::Scalar> = vec![A::zero().to_scalar(); new_size];
-
-    let new_strides = compute_contiguous_strides(&new_shape);
-    let old_size = shape.iter().product::<usize>().max(1);
-
-    for (old_linear, scalar) in data.iter().copied().enumerate().take(old_size) {
-        // Compute old multi-index (column-major)
-        let mut remaining = old_linear;
-        let mut new_linear = 0usize;
-        let mut new_dim = 0usize;
-        for (i, dim_size) in shape.iter().copied().enumerate() {
-            let coord = remaining % dim_size;
-            remaining /= dim_size;
-            if !trace_positions.contains(&i) {
-                new_linear += coord * new_strides[new_dim];
-                new_dim += 1;
-            }
-        }
-
-        let acc = A::from_scalar(result[new_linear]);
-        let val = A::from_scalar(scalar);
-        result[new_linear] = acc.add(val).to_scalar();
-    }
-
-    (result, new_shape, new_modes)
-}
+// Trace-mode reduction (`reduce_trace`) is shared with the CUDA tropical executor
+// and lives in `crate::backend::contract_plan`.
 
 fn group_base_stride(modes: &[i32], strides: &[usize], group_modes: &[i32]) -> isize {
     group_modes
@@ -584,7 +455,7 @@ where
         let (a_data, a_shape, a_modes) = {
             let mut a_contig = a_pool.acquire(shape_a.iter().product::<usize>().max(1));
             let a_contig = ensure_contiguous_into(a, shape_a, strides_a, a_contig.as_mut_vec());
-            reduce_trace_modes::<A>(a_contig.as_slice(), shape_a, modes_a, &left_trace)
+            reduce_trace::<A>(a_contig.as_slice(), shape_a, modes_a, &left_trace)
         };
         let a_strides = compute_contiguous_strides(&a_shape);
         (Some(a_data), a_shape, a_modes, a_strides)
@@ -595,7 +466,7 @@ where
         let (b_data, b_shape, b_modes) = {
             let mut b_contig = b_pool.acquire(shape_b.iter().product::<usize>().max(1));
             let b_contig = ensure_contiguous_into(b, shape_b, strides_b, b_contig.as_mut_vec());
-            reduce_trace_modes::<A>(b_contig.as_slice(), shape_b, modes_b, &right_trace)
+            reduce_trace::<A>(b_contig.as_slice(), shape_b, modes_b, &right_trace)
         };
         let b_strides = compute_contiguous_strides(&b_shape);
         (Some(b_data), b_shape, b_modes, b_strides)
@@ -784,12 +655,12 @@ where
         .collect();
 
     let (a_data, a_shape, a_modes) = if !left_trace.is_empty() {
-        reduce_trace_modes::<A>(&a_contig, shape_a, modes_a, &left_trace)
+        reduce_trace::<A>(&a_contig, shape_a, modes_a, &left_trace)
     } else {
         (a_contig, shape_a.to_vec(), modes_a.to_vec())
     };
     let (b_data, b_shape, b_modes) = if !right_trace.is_empty() {
-        reduce_trace_modes::<A>(&b_contig, shape_b, modes_b, &right_trace)
+        reduce_trace::<A>(&b_contig, shape_b, modes_b, &right_trace)
     } else {
         (b_contig, shape_b.to_vec(), modes_b.to_vec())
     };
