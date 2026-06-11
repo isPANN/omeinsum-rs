@@ -371,6 +371,78 @@ extern "C" __global__ void gather_batched64(unsigned long long* out_ptrs,
         out[o] = in[src];
     }
 }
+
+// Coalesced bit-permutation gather via a shared-memory tile transpose (the
+// cuTT / NVIDIA "tiled transpose" recipe). For binary tensor networks every
+// axis has extent 2, so a permutation of axes is a permutation of the linear
+// index's bits; when the innermost output bits and innermost input bits are
+// scrambled apart (identity-prefix 0), the plain element-wise gather above does
+// 4-byte scattered (non-coalesced) reads. This kernel restores coalescing: a
+// 32x32 tile over (A = output low 5 bits, B = the 5 output bits that map to the
+// input's low 5 bits) is loaded with coalesced reads along B, transposed in
+// shared memory (padded to 33 to avoid bank conflicts), and written with
+// coalesced stores along A. Remaining bits index the tile (one block each).
+// Host (`tiled_gather_plan`) supplies the bit-position maps and guarantees the
+// preconditions (all extents 2, A/B/batch disjoint, n>=10); anything else uses
+// the element-wise fallback, so this never changes results — only their speed.
+//   low_src[i]  : input-index bit position for output low bit i        (i=0..4)
+//   row_out[j]  : output-index bit position whose input bit is j        (j=0..4)
+//   batch_out[i]/batch_src[i] : output/input bit positions of batch bit i
+//   nbatch = n - 10; gridDim.x = 2^nbatch (one block per batch combination)
+#define GATHER_TILE 32
+#define GATHER_TILE_ROWS 8
+extern "C" __global__ void gather_tiled32(unsigned int* out, const unsigned int* in,
+        const long long* low_src, const long long* row_out,
+        const long long* batch_out, const long long* batch_src, int nbatch) {
+    __shared__ unsigned int tile[GATHER_TILE][GATHER_TILE + 1];
+    long long ob = 0, sb = 0;
+    unsigned int bid = blockIdx.x;
+    for (int i = 0; i < nbatch; ++i) {
+        if (bid & (1u << i)) { ob |= (1LL << batch_out[i]); sb |= (1LL << batch_src[i]); }
+    }
+    // Load: threadIdx.x = B (input low bits) -> coalesced read; rows = A.
+    int b = threadIdx.x;
+    for (int r = 0; r < GATHER_TILE; r += GATHER_TILE_ROWS) {
+        int a = threadIdx.y + r;
+        long long src = sb | (long long)b;
+        for (int i = 0; i < 5; ++i) if (a & (1 << i)) src |= (1LL << low_src[i]);
+        tile[a][b] = in[src];
+    }
+    __syncthreads();
+    // Store: threadIdx.x = A (output low bits) -> coalesced write; rows = B.
+    int a = threadIdx.x;
+    for (int r = 0; r < GATHER_TILE; r += GATHER_TILE_ROWS) {
+        int bb = threadIdx.y + r;
+        long long o = ob | (long long)a;
+        for (int j = 0; j < 5; ++j) if (bb & (1 << j)) o |= (1LL << row_out[j]);
+        out[o] = tile[a][bb];
+    }
+}
+extern "C" __global__ void gather_tiled64(unsigned long long* out, const unsigned long long* in,
+        const long long* low_src, const long long* row_out,
+        const long long* batch_out, const long long* batch_src, int nbatch) {
+    __shared__ unsigned long long tile[GATHER_TILE][GATHER_TILE + 1];
+    long long ob = 0, sb = 0;
+    unsigned int bid = blockIdx.x;
+    for (int i = 0; i < nbatch; ++i) {
+        if (bid & (1u << i)) { ob |= (1LL << batch_out[i]); sb |= (1LL << batch_src[i]); }
+    }
+    int b = threadIdx.x;
+    for (int r = 0; r < GATHER_TILE; r += GATHER_TILE_ROWS) {
+        int a = threadIdx.y + r;
+        long long src = sb | (long long)b;
+        for (int i = 0; i < 5; ++i) if (a & (1 << i)) src |= (1LL << low_src[i]);
+        tile[a][b] = in[src];
+    }
+    __syncthreads();
+    int a = threadIdx.x;
+    for (int r = 0; r < GATHER_TILE; r += GATHER_TILE_ROWS) {
+        int bb = threadIdx.y + r;
+        long long o = ob | (long long)a;
+        for (int j = 0; j < 5; ++j) if (bb & (1 << j)) o |= (1LL << row_out[j]);
+        out[o] = tile[a][bb];
+    }
+}
 "#;
 
 // SAFETY: Cuda is Send because all fields are Send.
@@ -539,6 +611,44 @@ impl Cuda {
         let mut out = unsafe { self.stream.alloc::<T>(numel.max(1)) }
             .expect("alloc device gather output");
         if numel == 0 {
+            return out;
+        }
+
+        // Coalesced fast path (C): when this is a large binary-tensor (all
+        // extents 2) bit-permutation whose innermost bits are scrambled apart,
+        // the element-wise kernel below reads non-coalesced; the shared-memory
+        // tile transpose restores coalescing. `tiled_gather_plan` returns `None`
+        // for anything it does not handle (non-power-of-two extents, small, or
+        // non-disjoint bit groups) so the element-wise path stays the universal,
+        // result-defining fallback.
+        if let Some(plan) = tiled_gather_plan(new_shape, src_strides) {
+            use cudarc::driver::{LaunchConfig, PushKernelArg};
+            let d_low = self.stream.clone_htod(&plan.low_src).expect("upload low_src");
+            let d_row = self.stream.clone_htod(&plan.row_out).expect("upload row_out");
+            let d_bout = self.stream.clone_htod(&plan.batch_out).expect("upload batch_out");
+            let d_bsrc = self.stream.clone_htod(&plan.batch_src).expect("upload batch_src");
+            let fname = match std::mem::size_of::<T>() {
+                4 => "gather_tiled32",
+                8 => "gather_tiled64",
+                other => panic!("device_gather: unsupported element width {other} bytes"),
+            };
+            let func = self.permute_function(fname);
+            let nbatch_i32 = plan.nbatch as i32;
+            let cfg = LaunchConfig {
+                grid_dim: (1u32 << plan.nbatch, 1, 1),
+                block_dim: (32, 8, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut builder = self.stream.launch_builder(&func);
+            builder
+                .arg(&mut out)
+                .arg(input)
+                .arg(&d_low)
+                .arg(&d_row)
+                .arg(&d_bout)
+                .arg(&d_bsrc)
+                .arg(&nbatch_i32);
+            unsafe { builder.launch(cfg) }.expect("launch tiled gather kernel");
             return out;
         }
 
@@ -1350,6 +1460,84 @@ fn record_gather_stat(new_shape: &[usize], src_strides: &[usize], numel: usize) 
     }
 }
 
+/// Plan for the coalesced tile-transpose gather fast path (see `gather_tiled32`).
+#[cfg(feature = "cuda-tropical")]
+struct TiledGatherPlan {
+    low_src: [i64; 5],
+    row_out: [i64; 5],
+    batch_out: Vec<i64>,
+    batch_src: Vec<i64>,
+    nbatch: usize,
+}
+
+/// Build a tile-transpose plan for `device_gather`'s coalesced fast path, or
+/// `None` if the gather is not an eligible large all-dim-2 bit permutation (so
+/// the caller uses the element-wise kernel — the universal, result-defining
+/// path). Eligible iff: every extent is 2 (the gather is then a permutation of
+/// the n-bit linear index); `n >= MIN_BITS` (only worth the tile machinery for
+/// large gathers); `src_strides` is a permutation of `{1,2,…,2^(n-1)}` (a pure
+/// bit permutation); and the output's low 5 bits all map to input bits ≥ 5, so
+/// the tile's A (output-low) and B (input-low) bit groups are disjoint. See
+/// `gather_tiled32` for how the returned maps drive the kernel.
+#[cfg(feature = "cuda-tropical")]
+fn tiled_gather_plan(new_shape: &[usize], src_strides: &[usize]) -> Option<TiledGatherPlan> {
+    const TILE_BITS: usize = 5;
+    const MIN_BITS: usize = 16; // numel >= 2^16 before the tile machinery pays off
+    let n = new_shape.len();
+    if n < 2 * TILE_BITS || n < MIN_BITS {
+        return None;
+    }
+    if new_shape.iter().any(|&d| d != 2) {
+        return None;
+    }
+    // q[b] = log2(src_strides[b]); must be a permutation of 0..n (pure bit perm).
+    let mut q = vec![0usize; n];
+    let mut seen = vec![false; n];
+    for b in 0..n {
+        let s = src_strides[b];
+        if s == 0 || (s & (s - 1)) != 0 {
+            return None; // not a power of two
+        }
+        let p = s.trailing_zeros() as usize;
+        if p >= n || seen[p] {
+            return None; // out of range / not a permutation
+        }
+        seen[p] = true;
+        q[b] = p;
+    }
+    // Disjointness: each output low bit (0..5) must map to an input bit >= 5.
+    if (0..TILE_BITS).any(|b| q[b] < TILE_BITS) {
+        return None;
+    }
+    let mut low_src = [0i64; 5];
+    for i in 0..TILE_BITS {
+        low_src[i] = q[i] as i64;
+    }
+    // Inverse permutation: row_out[j] = output bit position whose input bit is j.
+    let mut qinv = vec![usize::MAX; n];
+    for (b, &p) in q.iter().enumerate() {
+        qinv[p] = b;
+    }
+    let mut row_out = [0i64; 5];
+    for j in 0..TILE_BITS {
+        row_out[j] = qinv[j] as i64;
+    }
+    // Batch bits: output positions not in the low group (0..5) nor the row group.
+    let row_set: std::collections::HashSet<usize> = (0..TILE_BITS).map(|j| qinv[j]).collect();
+    let mut batch_out = Vec::new();
+    let mut batch_src = Vec::new();
+    for b in TILE_BITS..n {
+        if row_set.contains(&b) {
+            continue;
+        }
+        batch_out.push(b as i64);
+        batch_src.push(q[b] as i64);
+    }
+    let nbatch = batch_out.len();
+    debug_assert_eq!(nbatch, n - 2 * TILE_BITS);
+    Some(TiledGatherPlan { low_src, row_out, batch_out, batch_src, nbatch })
+}
+
 fn canonical_gather_args(
     perm: &[usize],
     shape: &[usize],
@@ -2102,6 +2290,65 @@ mod batched_gather_tests {
             (vec![2, 3, 4], vec![2, 1, 0]),
             (vec![6], vec![0]), // ndim == 1
         ]
+    }
+
+    /// Host reference for a strided gather (same column-major semantics as the
+    /// device kernels): `out[o] = in[Σ coord_ax(o) · src_strides[ax]]`.
+    fn cpu_gather(input: &[u32], new_shape: &[usize], src_strides: &[usize]) -> Vec<u32> {
+        let numel: usize = new_shape.iter().product();
+        (0..numel)
+            .map(|o| {
+                let mut rem = o;
+                let mut src = 0usize;
+                for (ax, &dim) in new_shape.iter().enumerate() {
+                    src += (rem % dim) * src_strides[ax];
+                    rem /= dim;
+                }
+                input[src]
+            })
+            .collect()
+    }
+
+    // C: the tiled coalesced fast path must match the CPU reference exactly, and
+    // must actually be taken (plan is Some) for eligible large all-dim-2 bit
+    // permutations — across several disjoint permutations and tensor ranks.
+    #[test]
+    fn tiled_gather_matches_reference() {
+        let cuda = Cuda::new().expect("init cuda");
+        let stream = cuda.stream.clone();
+        for &n in &[16usize, 17, 18] {
+            let new_shape = vec![2usize; n];
+            // Disjoint bit permutations (output low 5 bits -> input bits >= 5):
+            // (1) swap low-5 with the next 5; (2) swap low-5 with the top 5.
+            let perms: Vec<Vec<usize>> = vec![
+                (0..n).map(|i| if i < 5 { i + 5 } else if i < 10 { i - 5 } else { i }).collect(),
+                (0..n)
+                    .map(|i| {
+                        if i < 5 {
+                            n - 5 + i
+                        } else if i >= n - 5 {
+                            i - (n - 5)
+                        } else {
+                            i
+                        }
+                    })
+                    .collect(),
+            ];
+            for q in perms {
+                let src_strides: Vec<usize> = q.iter().map(|&p| 1usize << p).collect();
+                assert!(
+                    tiled_gather_plan(&new_shape, &src_strides).is_some(),
+                    "n={n} q={q:?} should be tiled-eligible (else the fast path is untested)"
+                );
+                let numel = 1usize << n;
+                let host: Vec<u32> = (0..numel as u32).collect();
+                let inp = stream.clone_htod(&host).expect("upload");
+                let got = cuda.device_gather::<u32>(&inp, &new_shape, &src_strides);
+                let got_h = stream.clone_dtoh(&got).expect("dtoh");
+                let want = cpu_gather(&host, &new_shape, &src_strides);
+                assert_eq!(got_h, want, "tiled gather n={n} q={q:?} mismatch vs cpu ref");
+            }
+        }
     }
 
     #[test]
