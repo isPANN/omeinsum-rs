@@ -255,6 +255,26 @@ pub struct Cuda {
     /// never per contraction.
     #[cfg(feature = "cuda-tropical")]
     permute_module: Arc<Mutex<Option<Arc<cudarc::driver::CudaModule>>>>,
+    /// Reusable device buffers for gather shape/stride metadata, keyed by tensor
+    /// rank (`ndim`). Each `device_gather` used to `clone_htod` two *fresh*
+    /// device buffers (shape + strides) per call — a large slice of the per-node
+    /// allocation churn (2 allocs × 2–3 gathers/node). Here one (shape, strides)
+    /// pair is allocated per distinct `ndim` on first use and re-uploaded via
+    /// `memcpy_htod`, so steady-state metadata allocations drop to ~0. Shared
+    /// across backend clones (like the other caches). The inner `Mutex` makes a
+    /// gather's upload-through-launch a critical section so concurrent slices
+    /// don't overwrite the shared buffer between each other's upload and kernel
+    /// (they serialize on the single stream regardless), and the buffers persist
+    /// in the map so a kernel reading them is never freed out from under it.
+    #[cfg(feature = "cuda-tropical")]
+    gather_meta: Arc<
+        Mutex<
+            std::collections::HashMap<
+                usize,
+                (cudarc::driver::CudaSlice<i64>, cudarc::driver::CudaSlice<i64>),
+            >,
+        >,
+    >,
 }
 
 /// Device strided-gather kernels: `out[o] = in[Σ coord_ax · src_strides[ax]]`,
@@ -318,6 +338,8 @@ impl Clone for Cuda {
             tropical_ctx: self.tropical_ctx.clone(),
             #[cfg(feature = "cuda-tropical")]
             permute_module: self.permute_module.clone(),
+            #[cfg(feature = "cuda-tropical")]
+            gather_meta: self.gather_meta.clone(),
         }
     }
 }
@@ -356,6 +378,8 @@ impl Cuda {
             tropical_ctx: Arc::new(Mutex::new(None)),
             #[cfg(feature = "cuda-tropical")]
             permute_module: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "cuda-tropical")]
+            gather_meta: Arc::new(Mutex::new(std::collections::HashMap::new())),
         })
     }
 
@@ -457,15 +481,8 @@ impl Cuda {
 
         let shape_i64: Vec<i64> = new_shape.iter().map(|&x| x as i64).collect();
         let strides_i64: Vec<i64> = src_strides.iter().map(|&x| x as i64).collect();
-        let d_shape = self
-            .stream
-            .clone_htod(&shape_i64)
-            .expect("upload gather shape");
-        let d_strides = self
-            .stream
-            .clone_htod(&strides_i64)
-            .expect("upload gather strides");
-        let ndim = new_shape.len() as i32;
+        let ndim_us = new_shape.len();
+        let ndim = ndim_us as i32;
         let numel_i64 = numel as i64;
 
         let fname = match std::mem::size_of::<T>() {
@@ -475,15 +492,44 @@ impl Cuda {
         };
         let func = self.permute_function(fname);
         let cfg = LaunchConfig::for_num_elems(numel as u32);
+
+        // Reuse per-ndim metadata buffers: allocate one (shape, strides) pair per
+        // distinct rank on first use, then re-upload into them with `memcpy_htod`
+        // instead of `clone_htod`-allocating a fresh pair every gather. The lock
+        // is held through the launch so a concurrent slice can't overwrite the
+        // shared buffers between this gather's upload and its kernel (they
+        // serialize on the single stream anyway); the buffers live in the map, so
+        // the enqueued kernel never reads a freed allocation.
+        let mut meta = self.gather_meta.lock().unwrap();
+        if !meta.contains_key(&ndim_us) {
+            let s = self
+                .stream
+                .alloc_zeros::<i64>(ndim_us)
+                .expect("alloc gather shape scratch");
+            let t = self
+                .stream
+                .alloc_zeros::<i64>(ndim_us)
+                .expect("alloc gather strides scratch");
+            meta.insert(ndim_us, (s, t));
+        }
+        let (d_shape, d_strides) = meta.get_mut(&ndim_us).unwrap();
+        self.stream
+            .memcpy_htod(&shape_i64, d_shape)
+            .expect("upload gather shape");
+        self.stream
+            .memcpy_htod(&strides_i64, d_strides)
+            .expect("upload gather strides");
+
         let mut builder = self.stream.launch_builder(&func);
         builder
             .arg(&mut out)
             .arg(input)
             .arg(&ndim)
-            .arg(&d_shape)
-            .arg(&d_strides)
+            .arg(&*d_shape)
+            .arg(&*d_strides)
             .arg(&numel_i64);
         unsafe { builder.launch(cfg) }.expect("launch device gather kernel");
+        drop(meta);
         out
     }
 
