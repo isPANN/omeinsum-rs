@@ -88,6 +88,11 @@ name = "tropical_network"
 path = "examples/tropical_network.rs"
 required-features = ["tropical"]
 
+[[example]]
+name = "tropical_network_gpu"
+path = "examples/tropical_network_gpu.rs"
+required-features = ["cuda-tropical"]
+
 [workspace]
 members = [".", "omeinsum-cli"]
 

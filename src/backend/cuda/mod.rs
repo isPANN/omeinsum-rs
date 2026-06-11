@@ -52,7 +52,7 @@ use cudarc::driver::{CudaContext, CudaStream};
 use cutensor::{contract, CacheKey, CutensorType, Handle, PlanCache, TensorDesc};
 use num_complex::Complex;
 use std::sync::Arc;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "cuda-tropical"))]
 use std::sync::Mutex;
 
 use crate::algebra::{Algebra, Scalar};
@@ -232,7 +232,54 @@ pub struct Cuda {
     handle: Mutex<Option<Handle>>,
     #[cfg(feature = "cuda")]
     cache: Mutex<PlanCache>,
+    /// `tropical-gemm-cuda` context built once from the shared CUDA device and
+    /// reused across contraction nodes, instead of rebuilt (which reloads the
+    /// kernel module) on every tropical GEMM. Lazily initialized on first use.
+    #[cfg(feature = "cuda-tropical")]
+    tropical_ctx: Mutex<Option<Arc<tropical_gemm_cuda::CudaContext>>>,
+    /// NVRTC-compiled module holding the device strided-gather kernels
+    /// (`gather32`/`gather64`) used for on-device operand canonicalization and
+    /// output permutation. Compiled once and cached, never per contraction.
+    #[cfg(feature = "cuda-tropical")]
+    permute_module: Mutex<Option<Arc<cudarc::driver::CudaModule>>>,
 }
+
+/// Device strided-gather kernels: `out[o] = in[Σ coord_ax · src_strides[ax]]`,
+/// where `o` ranges over the contiguous column-major output and its multi-index
+/// is decoded against `new_shape`. One kernel per element width (32/64-bit);
+/// `src_strides`/`new_shape` are passed in element units as `long long`. This is
+/// the device counterpart of the host `materialize_strided` and covers operand
+/// canonicalization (strided view → canonical layout) and the output permute,
+/// for f32/f64 (via width) and the u32 argmax buffer (via `gather32`).
+#[cfg(feature = "cuda-tropical")]
+const PERMUTE_KERNEL_SRC: &str = r#"
+extern "C" __global__ void gather32(unsigned int* out, const unsigned int* in,
+                                    int ndim, const long long* new_shape,
+                                    const long long* src_strides, long long numel) {
+    long long o = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= numel) return;
+    long long rem = o, src = 0;
+    for (int ax = 0; ax < ndim; ++ax) {
+        long long c = rem % new_shape[ax];
+        rem /= new_shape[ax];
+        src += c * src_strides[ax];
+    }
+    out[o] = in[src];
+}
+extern "C" __global__ void gather64(unsigned long long* out, const unsigned long long* in,
+                                    int ndim, const long long* new_shape,
+                                    const long long* src_strides, long long numel) {
+    long long o = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= numel) return;
+    long long rem = o, src = 0;
+    for (int ax = 0; ax < ndim; ++ax) {
+        long long c = rem % new_shape[ax];
+        rem /= new_shape[ax];
+        src += c * src_strides[ax];
+    }
+    out[o] = in[src];
+}
+"#;
 
 // SAFETY: Cuda is Send because all fields are Send.
 // The Mutex ensures safe concurrent access to handle and cache.
@@ -251,6 +298,10 @@ impl Clone for Cuda {
             handle: Mutex::new(None),
             #[cfg(feature = "cuda")]
             cache: Mutex::new(PlanCache::new(64)),
+            #[cfg(feature = "cuda-tropical")]
+            tropical_ctx: Mutex::new(None),
+            #[cfg(feature = "cuda-tropical")]
+            permute_module: Mutex::new(None),
         }
     }
 }
@@ -285,6 +336,10 @@ impl Cuda {
             handle: Mutex::new(None),
             #[cfg(feature = "cuda")]
             cache: Mutex::new(PlanCache::new(64)),
+            #[cfg(feature = "cuda-tropical")]
+            tropical_ctx: Mutex::new(None),
+            #[cfg(feature = "cuda-tropical")]
+            permute_module: Mutex::new(None),
         })
     }
 
@@ -315,6 +370,101 @@ impl Cuda {
             );
         }
         f(h.as_ref().unwrap())
+    }
+
+    /// Return the cached `tropical-gemm-cuda` context, building it once from the
+    /// shared CUDA device on first use. Rebuilding this per node reloads the
+    /// kernel module, so it is cached here and an `Arc` clone is handed out
+    /// (the lock is released before the GEMM runs, so concurrent contractions
+    /// are not serialized on it).
+    #[cfg(feature = "cuda-tropical")]
+    fn tropical_context(&self) -> Arc<tropical_gemm_cuda::CudaContext> {
+        let mut guard = self.tropical_ctx.lock().unwrap();
+        if guard.is_none() {
+            let tctx = tropical_gemm_cuda::CudaContext::from_device(self.ctx.clone())
+                .expect("failed to build tropical-gemm-cuda context from the shared CUDA device");
+            *guard = Some(Arc::new(tctx));
+        }
+        guard.as_ref().unwrap().clone()
+    }
+
+    /// Load a device gather kernel by name, compiling and caching the NVRTC
+    /// module ([`PERMUTE_KERNEL_SRC`]) once on first use.
+    #[cfg(feature = "cuda-tropical")]
+    fn permute_function(&self, name: &str) -> cudarc::driver::CudaFunction {
+        let mut guard = self.permute_module.lock().unwrap();
+        if guard.is_none() {
+            let ptx = cudarc::nvrtc::compile_ptx(PERMUTE_KERNEL_SRC)
+                .expect("compile device permute kernels");
+            let module = self
+                .ctx
+                .load_module(ptx)
+                .expect("load device permute module");
+            *guard = Some(module);
+        }
+        guard
+            .as_ref()
+            .unwrap()
+            .load_function(name)
+            .expect("load device gather function")
+    }
+
+    /// Device counterpart of `materialize_strided`: gather `input` (a column-major
+    /// buffer with element strides `src_strides[ax]` along output axis `ax`) into a
+    /// fresh contiguous column-major buffer of shape `new_shape`. Used for operand
+    /// canonicalization and output permutation without leaving the GPU. The kernel
+    /// is selected by element width (f32/u32 → `gather32`, f64 → `gather64`).
+    #[cfg(feature = "cuda-tropical")]
+    fn device_gather<T>(
+        &self,
+        input: &cudarc::driver::CudaSlice<T>,
+        new_shape: &[usize],
+        src_strides: &[usize],
+    ) -> cudarc::driver::CudaSlice<T>
+    where
+        T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default + Clone,
+    {
+        use cudarc::driver::{LaunchConfig, PushKernelArg};
+
+        let numel: usize = new_shape.iter().product();
+        let mut out = self
+            .stream
+            .alloc_zeros::<T>(numel.max(1))
+            .expect("alloc device gather output");
+        if numel == 0 {
+            return out;
+        }
+
+        let shape_i64: Vec<i64> = new_shape.iter().map(|&x| x as i64).collect();
+        let strides_i64: Vec<i64> = src_strides.iter().map(|&x| x as i64).collect();
+        let d_shape = self
+            .stream
+            .clone_htod(&shape_i64)
+            .expect("upload gather shape");
+        let d_strides = self
+            .stream
+            .clone_htod(&strides_i64)
+            .expect("upload gather strides");
+        let ndim = new_shape.len() as i32;
+        let numel_i64 = numel as i64;
+
+        let fname = match std::mem::size_of::<T>() {
+            4 => "gather32",
+            8 => "gather64",
+            other => panic!("device_gather: unsupported element width {other} bytes"),
+        };
+        let func = self.permute_function(fname);
+        let cfg = LaunchConfig::for_num_elems(numel as u32);
+        let mut builder = self.stream.launch_builder(&func);
+        builder
+            .arg(&mut out)
+            .arg(input)
+            .arg(&ndim)
+            .arg(&d_shape)
+            .arg(&d_strides)
+            .arg(&numel_i64);
+        unsafe { builder.launch(cfg) }.expect("launch device gather kernel");
+        out
     }
 
     /// Perform a tensor contraction using cuTENSOR.
@@ -432,10 +582,13 @@ impl Cuda {
     /// **column-major** — the same order omeinsum uses — so operands are passed
     /// straight through with no swap.
     ///
-    /// Operand materialization (gather of strided views, trace reduction, and
-    /// the canonical permutation) currently runs on the host via a
-    /// download/upload roundtrip, matching the existing [`Cuda::copy_strided`]
-    /// path; a device-side permute is a later optimization (plan Phase 5).
+    /// Operand canonicalization (gather of strided views and the canonical
+    /// permutation) and the output permute run **on the device** via the
+    /// [`Cuda::device_gather`] NVRTC kernel, so the whole contraction stays
+    /// GPU-resident with no host roundtrip ([`Cuda::contract_tropical_device`]).
+    /// The one exception is trace modes (repeated labels needing a semiring
+    /// pre-reduction the gather kernel doesn't perform): those fall back to the
+    /// host operand-prep path ([`Cuda::plan_tropical_operands`]).
     #[cfg(feature = "cuda-tropical")]
     #[allow(clippy::too_many_arguments)]
     fn contract_tropical<A: Algebra>(
@@ -454,8 +607,20 @@ impl Cuda {
     where
         A::Scalar: BackendScalar<Self>,
     {
-        // Prepare canonical operands, run the (batched) GEMM, permute the result
-        // `[left, right, batch]` back to `modes_c`, and upload.
+        let plan = crate::backend::contract_plan::plan_contraction(
+            modes_a, shape_a, modes_b, shape_b, modes_c,
+        );
+        if !plan.has_trace() {
+            // Device-resident fast path: canonicalize operands and permute the
+            // result entirely on the GPU (no host roundtrip).
+            return self.contract_tropical_device::<A>(
+                &plan, a, shape_a, strides_a, modes_a, b, shape_b, strides_b, modes_b, shape_c,
+                modes_c,
+            );
+        }
+        // Trace fallback: repeated-label modes need a semiring (max/min)
+        // pre-reduction that the device gather kernel doesn't perform, so prep
+        // operands on the host (download → reduce → permute → upload).
         let (plan, a_canon, b_canon) = self.plan_tropical_operands::<A>(
             a, shape_a, strides_a, modes_a, b, shape_b, strides_b, modes_b, modes_c,
         );
@@ -470,6 +635,87 @@ impl Cuda {
         );
         let c_final = permute_tropical_output(c_canon, &plan, shape_c, modes_c);
         self.from_slice(&c_final)
+    }
+
+    /// Device-resident no-trace tropical contraction: gather each operand into
+    /// its canonical column-major layout with [`Cuda::device_gather`], run the
+    /// device GEMM core, and permute the result back to `modes_c` — all on the
+    /// GPU, returning device storage with no host transfer. Caller guarantees
+    /// `!plan.has_trace()`.
+    #[cfg(feature = "cuda-tropical")]
+    #[allow(clippy::too_many_arguments)]
+    fn contract_tropical_device<A: Algebra>(
+        &self,
+        plan: &crate::backend::contract_plan::ContractionPlan,
+        a: &CudaStorage<A::Scalar>,
+        shape_a: &[usize],
+        strides_a: &[usize],
+        modes_a: &[i32],
+        b: &CudaStorage<A::Scalar>,
+        shape_b: &[usize],
+        strides_b: &[usize],
+        modes_b: &[i32],
+        shape_c: &[usize],
+        modes_c: &[i32],
+    ) -> CudaStorage<A::Scalar>
+    where
+        A::Scalar: BackendScalar<Self>,
+    {
+        use crate::algebra::{MaxMul, MaxPlus, MinPlus};
+        use std::any::TypeId;
+        use tropical_gemm::{TropicalMaxMul, TropicalMaxPlus, TropicalMinPlus};
+
+        let (a_new_shape, a_src_strides) =
+            canonical_gather_args(plan.a_permutation(modes_a).as_slice(), shape_a, strides_a);
+        let (b_new_shape, b_src_strides) =
+            canonical_gather_args(plan.b_permutation(modes_b).as_slice(), shape_b, strides_b);
+        let out_gather = output_gather_args(plan, shape_c, modes_c);
+        let batch = plan.batch_size.max(1);
+        let (left, contract, right) = (plan.left_size, plan.contract_size, plan.right_size);
+
+        let tctx = self.tropical_context();
+        let stream = &self.stream;
+
+        macro_rules! dispatch {
+            ($kernel:ty, $scalar:ty) => {{
+                let a_slice: &cudarc::driver::CudaSlice<$scalar> =
+                    unsafe { std::mem::transmute(a.slice()) };
+                let b_slice: &cudarc::driver::CudaSlice<$scalar> =
+                    unsafe { std::mem::transmute(b.slice()) };
+                let a_canon = self.device_gather::<$scalar>(a_slice, &a_new_shape, &a_src_strides);
+                let b_canon = self.device_gather::<$scalar>(b_slice, &b_new_shape, &b_src_strides);
+                let c_canon = batched_tropical_gemm_dev::<$kernel>(
+                    &tctx, stream, &a_canon, &b_canon, batch, left, contract, right,
+                );
+                let c_final = match &out_gather {
+                    None => c_canon,
+                    Some((ns, ss)) => self.device_gather::<$scalar>(&c_canon, ns, ss),
+                };
+                let c_storage: cudarc::driver::CudaSlice<A::Scalar> =
+                    unsafe { std::mem::transmute(c_final) };
+                CudaStorage::new(c_storage, self.stream.clone())
+            }};
+        }
+
+        if TypeId::of::<A>() == TypeId::of::<MaxPlus<f32>>() {
+            dispatch!(TropicalMaxPlus<f32>, f32)
+        } else if TypeId::of::<A>() == TypeId::of::<MaxPlus<f64>>() {
+            dispatch!(TropicalMaxPlus<f64>, f64)
+        } else if TypeId::of::<A>() == TypeId::of::<MinPlus<f32>>() {
+            dispatch!(TropicalMinPlus<f32>, f32)
+        } else if TypeId::of::<A>() == TypeId::of::<MinPlus<f64>>() {
+            dispatch!(TropicalMinPlus<f64>, f64)
+        } else if TypeId::of::<A>() == TypeId::of::<MaxMul<f32>>() {
+            dispatch!(TropicalMaxMul<f32>, f32)
+        } else if TypeId::of::<A>() == TypeId::of::<MaxMul<f64>>() {
+            dispatch!(TropicalMaxMul<f64>, f64)
+        } else {
+            panic!(
+                "CUDA tropical contraction is only implemented for MaxPlus/MinPlus/MaxMul \
+                 over f32/f64; got algebra {:?}",
+                std::any::type_name::<A>()
+            );
+        }
     }
 
     /// Tropical forward contraction with argmax tracking (winner `k`-index per
@@ -501,6 +747,16 @@ impl Cuda {
     where
         A::Scalar: BackendScalar<Self>,
     {
+        let plan = crate::backend::contract_plan::plan_contraction(
+            modes_a, shape_a, modes_b, shape_b, modes_c,
+        );
+        if !plan.has_trace() {
+            return self.contract_tropical_with_argmax_device::<A>(
+                &plan, a, shape_a, strides_a, modes_a, b, shape_b, strides_b, modes_b, shape_c,
+                modes_c,
+            );
+        }
+        // Trace fallback (host operand prep); see `contract_tropical`.
         let (plan, a_canon, b_canon) = self.plan_tropical_operands::<A>(
             a, shape_a, strides_a, modes_a, b, shape_b, strides_b, modes_b, modes_c,
         );
@@ -516,6 +772,92 @@ impl Cuda {
         let c_final = permute_tropical_output(c_canon, &plan, shape_c, modes_c);
         let argmax_final = permute_tropical_output(argmax_canon, &plan, shape_c, modes_c);
         (self.from_slice(&c_final), self.from_slice(&argmax_final))
+    }
+
+    /// Device-resident no-trace counterpart of [`Cuda::contract_tropical_device`]
+    /// with argmax tracking. The argmax buffer is permuted by the **same**
+    /// `output_perm` as the result (via `gather32`, since it is `u32`), so the two
+    /// stay index-consistent for `backward`. Caller guarantees `!plan.has_trace()`.
+    #[cfg(feature = "cuda-tropical")]
+    #[allow(clippy::too_many_arguments)]
+    fn contract_tropical_with_argmax_device<A: Algebra<Index = u32>>(
+        &self,
+        plan: &crate::backend::contract_plan::ContractionPlan,
+        a: &CudaStorage<A::Scalar>,
+        shape_a: &[usize],
+        strides_a: &[usize],
+        modes_a: &[i32],
+        b: &CudaStorage<A::Scalar>,
+        shape_b: &[usize],
+        strides_b: &[usize],
+        modes_b: &[i32],
+        shape_c: &[usize],
+        modes_c: &[i32],
+    ) -> (CudaStorage<A::Scalar>, CudaStorage<u32>)
+    where
+        A::Scalar: BackendScalar<Self>,
+    {
+        use crate::algebra::{MaxMul, MaxPlus, MinPlus};
+        use std::any::TypeId;
+        use tropical_gemm::{TropicalMaxMul, TropicalMaxPlus, TropicalMinPlus};
+
+        let (a_new_shape, a_src_strides) =
+            canonical_gather_args(plan.a_permutation(modes_a).as_slice(), shape_a, strides_a);
+        let (b_new_shape, b_src_strides) =
+            canonical_gather_args(plan.b_permutation(modes_b).as_slice(), shape_b, strides_b);
+        let out_gather = output_gather_args(plan, shape_c, modes_c);
+        let batch = plan.batch_size.max(1);
+        let (left, contract, right) = (plan.left_size, plan.contract_size, plan.right_size);
+
+        let tctx = self.tropical_context();
+        let stream = &self.stream;
+
+        macro_rules! dispatch {
+            ($kernel:ty, $scalar:ty) => {{
+                let a_slice: &cudarc::driver::CudaSlice<$scalar> =
+                    unsafe { std::mem::transmute(a.slice()) };
+                let b_slice: &cudarc::driver::CudaSlice<$scalar> =
+                    unsafe { std::mem::transmute(b.slice()) };
+                let a_canon = self.device_gather::<$scalar>(a_slice, &a_new_shape, &a_src_strides);
+                let b_canon = self.device_gather::<$scalar>(b_slice, &b_new_shape, &b_src_strides);
+                let (c_canon, argmax_canon) = batched_tropical_gemm_dev_with_argmax::<$kernel>(
+                    &tctx, stream, &a_canon, &b_canon, batch, left, contract, right,
+                );
+                let (c_final, argmax_final) = match &out_gather {
+                    None => (c_canon, argmax_canon),
+                    Some((ns, ss)) => (
+                        self.device_gather::<$scalar>(&c_canon, ns, ss),
+                        self.device_gather::<u32>(&argmax_canon, ns, ss),
+                    ),
+                };
+                let c_storage: cudarc::driver::CudaSlice<A::Scalar> =
+                    unsafe { std::mem::transmute(c_final) };
+                (
+                    CudaStorage::new(c_storage, self.stream.clone()),
+                    CudaStorage::new(argmax_final, self.stream.clone()),
+                )
+            }};
+        }
+
+        if TypeId::of::<A>() == TypeId::of::<MaxPlus<f32>>() {
+            dispatch!(TropicalMaxPlus<f32>, f32)
+        } else if TypeId::of::<A>() == TypeId::of::<MaxPlus<f64>>() {
+            dispatch!(TropicalMaxPlus<f64>, f64)
+        } else if TypeId::of::<A>() == TypeId::of::<MinPlus<f32>>() {
+            dispatch!(TropicalMinPlus<f32>, f32)
+        } else if TypeId::of::<A>() == TypeId::of::<MinPlus<f64>>() {
+            dispatch!(TropicalMinPlus<f64>, f64)
+        } else if TypeId::of::<A>() == TypeId::of::<MaxMul<f32>>() {
+            dispatch!(TropicalMaxMul<f32>, f32)
+        } else if TypeId::of::<A>() == TypeId::of::<MaxMul<f64>>() {
+            dispatch!(TropicalMaxMul<f64>, f64)
+        } else {
+            panic!(
+                "CUDA tropical argmax contraction is only implemented for \
+                 MaxPlus/MinPlus/MaxMul over f32/f64; got algebra {:?}",
+                std::any::type_name::<A>()
+            );
+        }
     }
 
     /// Download both operands, reduce any trace modes, and permute each into the
@@ -604,8 +946,8 @@ impl Cuda {
         use std::any::TypeId;
         use tropical_gemm::{TropicalMaxMul, TropicalMaxPlus, TropicalMinPlus};
 
-        let tctx = tropical_gemm_cuda::CudaContext::from_device(self.ctx.clone())
-            .expect("failed to build tropical-gemm-cuda context from the shared CUDA device");
+        let tctx = self.tropical_context();
+        let stream = &self.stream;
 
         // The omeinsum algebra types (`A::Scalar` = f32/f64) and the tropical-gemm
         // kernel scalar types share an identical `repr(transparent)` layout, so the
@@ -615,7 +957,7 @@ impl Cuda {
             ($kernel:ty, $scalar:ty) => {{
                 let a_s: &[$scalar] = unsafe { std::mem::transmute(a) };
                 let b_s: &[$scalar] = unsafe { std::mem::transmute(b) };
-                let out = batched_tropical_gemm::<$kernel>(&tctx, a_s, b_s, batch, m, k, n);
+                let out = batched_tropical_gemm::<$kernel>(&tctx, stream, a_s, b_s, batch, m, k, n);
                 unsafe { std::mem::transmute::<Vec<$scalar>, Vec<A::Scalar>>(out) }
             }};
         }
@@ -660,8 +1002,8 @@ impl Cuda {
         use std::any::TypeId;
         use tropical_gemm::{TropicalMaxMul, TropicalMaxPlus, TropicalMinPlus};
 
-        let tctx = tropical_gemm_cuda::CudaContext::from_device(self.ctx.clone())
-            .expect("failed to build tropical-gemm-cuda context from the shared CUDA device");
+        let tctx = self.tropical_context();
+        let stream = &self.stream;
 
         // Same `repr(transparent)` byte-identity transmutes as `run_tropical_gemm`;
         // the argmax buffer is `u32` on both sides, so it needs no reinterpretation.
@@ -669,8 +1011,9 @@ impl Cuda {
             ($kernel:ty, $scalar:ty) => {{
                 let a_s: &[$scalar] = unsafe { std::mem::transmute(a) };
                 let b_s: &[$scalar] = unsafe { std::mem::transmute(b) };
-                let (out, argmax) =
-                    batched_tropical_gemm_with_argmax::<$kernel>(&tctx, a_s, b_s, batch, m, k, n);
+                let (out, argmax) = batched_tropical_gemm_with_argmax::<$kernel>(
+                    &tctx, stream, a_s, b_s, batch, m, k, n,
+                );
                 (
                     unsafe { std::mem::transmute::<Vec<$scalar>, Vec<A::Scalar>>(out) },
                     argmax,
@@ -698,6 +1041,53 @@ impl Cuda {
             );
         }
     }
+}
+
+/// `(new_shape, src_strides)` for a [`Cuda::device_gather`] that applies `perm`
+/// to a column-major operand of shape `shape` with element strides `strides`:
+/// `new_shape[i] = shape[perm[i]]`, `src_strides[i] = strides[perm[i]]`. This is
+/// the device-side counterpart of the host `materialize_strided`'s indexing.
+#[cfg(feature = "cuda-tropical")]
+fn canonical_gather_args(
+    perm: &[usize],
+    shape: &[usize],
+    strides: &[usize],
+) -> (Vec<usize>, Vec<usize>) {
+    let new_shape = perm.iter().map(|&p| shape[p]).collect();
+    let src_strides = perm.iter().map(|&p| strides[p]).collect();
+    (new_shape, src_strides)
+}
+
+/// `(new_shape, src_strides)` for the device output permute, or `None` when the
+/// canonical `[left, right, batch]` order already equals `modes_c`. Matches
+/// [`permute_tropical_output`]: the GEMM result is contiguous column-major over
+/// `current_order = left ++ right ++ batch` modes, permuted by `output_perm`.
+#[cfg(feature = "cuda-tropical")]
+fn output_gather_args(
+    plan: &crate::backend::contract_plan::ContractionPlan,
+    shape_c: &[usize],
+    modes_c: &[i32],
+) -> Option<(Vec<usize>, Vec<usize>)> {
+    use crate::backend::contract_plan::mode_position;
+    use crate::tensor::compute_contiguous_strides;
+
+    plan.output_perm.as_ref().map(|out_perm| {
+        let current_order: Vec<i32> = plan
+            .left_modes
+            .iter()
+            .chain(plan.right_modes.iter())
+            .chain(plan.batch_modes.iter())
+            .copied()
+            .collect();
+        let c_shape_current: Vec<usize> = current_order
+            .iter()
+            .map(|&m| shape_c[mode_position(modes_c, m)])
+            .collect();
+        let contig = compute_contiguous_strides(&c_shape_current);
+        let new_shape = out_perm.iter().map(|&p| c_shape_current[p]).collect();
+        let src_strides = out_perm.iter().map(|&p| contig[p]).collect();
+        (new_shape, src_strides)
+    })
 }
 
 /// Permute a GEMM output buffer (column-major `[left, right, batch]`) back to the
@@ -737,11 +1127,133 @@ fn permute_tropical_output<T: Copy + Default>(
     }
 }
 
-/// Run a canonical column-major (batched) tropical GEMM on the shared context,
-/// looping per batch slice. `K` selects the concrete semiring × scalar kernel.
+/// Device-resident core of the canonical column-major (batched) tropical GEMM:
+/// operands are already on the GPU, and the result stays on the GPU. Each slice
+/// is wrapped zero-host-roundtrip via an on-device `clone_dtod` +
+/// [`GpuMatrix::from_cuda_slice`] and assembled into the output with
+/// `memcpy_dtod`. `K` selects the concrete semiring × scalar kernel. Shared by
+/// the device contraction path and the host-buffer wrapper below.
 #[cfg(feature = "cuda-tropical")]
+#[allow(clippy::too_many_arguments)]
+fn batched_tropical_gemm_dev<K>(
+    ctx: &tropical_gemm_cuda::CudaContext,
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    a_dev: &cudarc::driver::CudaSlice<K::Scalar>,
+    b_dev: &cudarc::driver::CudaSlice<K::Scalar>,
+    batch: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> cudarc::driver::CudaSlice<K::Scalar>
+where
+    K: tropical_gemm_cuda::CudaKernel,
+    K::Scalar: cudarc::driver::DeviceRepr + Default + Clone + cudarc::driver::ValidAsZeroBits,
+{
+    use tropical_gemm_cuda::{tropical_gemm_gpu, GpuMatrix};
+
+    let (a_stride, b_stride, c_stride) = (m * k, k * n, m * n);
+    let mut c_dev = stream
+        .alloc_zeros::<K::Scalar>(batch * c_stride)
+        .expect("alloc tropical GEMM batch C");
+
+    for i in 0..batch {
+        // Own a device copy of each slice (no host transfer) to hand to the
+        // GEMM, which takes ownership of its operand allocations.
+        let a_i = stream
+            .clone_dtod(&a_dev.slice(i * a_stride..(i + 1) * a_stride))
+            .expect("slice tropical GEMM operand A");
+        let b_i = stream
+            .clone_dtod(&b_dev.slice(i * b_stride..(i + 1) * b_stride))
+            .expect("slice tropical GEMM operand B");
+        let a_gpu =
+            GpuMatrix::from_cuda_slice(ctx, a_i, m, k).expect("wrap tropical GEMM operand A");
+        let b_gpu =
+            GpuMatrix::from_cuda_slice(ctx, b_i, k, n).expect("wrap tropical GEMM operand B");
+        let mut c_gpu = GpuMatrix::alloc(ctx, m, n).expect("alloc tropical GEMM output");
+        tropical_gemm_gpu::<K>(ctx, &a_gpu, &b_gpu, &mut c_gpu).expect("tropical GEMM kernel");
+        let c_i = c_gpu.into_inner();
+        let mut dst = c_dev
+            .try_slice_mut(i * c_stride..(i + 1) * c_stride)
+            .expect("slice tropical GEMM output");
+        stream
+            .memcpy_dtod(&c_i, &mut dst)
+            .expect("assemble tropical GEMM output on device");
+    }
+    c_dev
+}
+
+/// Argmax-tracking device-resident core (see [`batched_tropical_gemm_dev`]).
+/// Returns the result and the argmax `k`-indices, both still on the GPU.
+#[cfg(feature = "cuda-tropical")]
+#[allow(clippy::too_many_arguments)]
+fn batched_tropical_gemm_dev_with_argmax<K>(
+    ctx: &tropical_gemm_cuda::CudaContext,
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    a_dev: &cudarc::driver::CudaSlice<K::Scalar>,
+    b_dev: &cudarc::driver::CudaSlice<K::Scalar>,
+    batch: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> (
+    cudarc::driver::CudaSlice<K::Scalar>,
+    cudarc::driver::CudaSlice<u32>,
+)
+where
+    K: tropical_gemm_cuda::CudaKernelWithArgmax,
+    K::Scalar: cudarc::driver::DeviceRepr + Default + Clone + cudarc::driver::ValidAsZeroBits,
+{
+    use tropical_gemm_cuda::{tropical_gemm_gpu_with_argmax, GpuMatrix, GpuMatrixWithArgmax};
+
+    let (a_stride, b_stride, c_stride) = (m * k, k * n, m * n);
+    let mut c_dev = stream
+        .alloc_zeros::<K::Scalar>(batch * c_stride)
+        .expect("alloc tropical GEMM batch C");
+    let mut argmax_dev = stream
+        .alloc_zeros::<u32>(batch * c_stride)
+        .expect("alloc tropical GEMM batch argmax");
+
+    for i in 0..batch {
+        let a_i = stream
+            .clone_dtod(&a_dev.slice(i * a_stride..(i + 1) * a_stride))
+            .expect("slice tropical GEMM operand A");
+        let b_i = stream
+            .clone_dtod(&b_dev.slice(i * b_stride..(i + 1) * b_stride))
+            .expect("slice tropical GEMM operand B");
+        let a_gpu =
+            GpuMatrix::from_cuda_slice(ctx, a_i, m, k).expect("wrap tropical GEMM operand A");
+        let b_gpu =
+            GpuMatrix::from_cuda_slice(ctx, b_i, k, n).expect("wrap tropical GEMM operand B");
+        let mut c_gpu = GpuMatrixWithArgmax::alloc(ctx, m, n).expect("alloc tropical GEMM output");
+        tropical_gemm_gpu_with_argmax::<K>(ctx, &a_gpu, &b_gpu, &mut c_gpu)
+            .expect("tropical GEMM argmax kernel");
+        let (mat, arg) = c_gpu.into_parts();
+        let c_i = mat.into_inner();
+        let arg_i = arg.into_inner();
+        let mut c_dst = c_dev
+            .try_slice_mut(i * c_stride..(i + 1) * c_stride)
+            .expect("slice tropical GEMM output");
+        stream
+            .memcpy_dtod(&c_i, &mut c_dst)
+            .expect("assemble tropical GEMM output on device");
+        let mut arg_dst = argmax_dev
+            .try_slice_mut(i * c_stride..(i + 1) * c_stride)
+            .expect("slice tropical GEMM argmax");
+        stream
+            .memcpy_dtod(&arg_i, &mut arg_dst)
+            .expect("assemble tropical GEMM argmax on device");
+    }
+    (c_dev, argmax_dev)
+}
+
+/// Host-buffer wrapper over [`batched_tropical_gemm_dev`]: bulk-upload the batch
+/// once, run the device core, bulk-download. Used by the trace fallback path,
+/// whose operand prep still happens on the host.
+#[cfg(feature = "cuda-tropical")]
+#[allow(clippy::too_many_arguments)]
 fn batched_tropical_gemm<K>(
     ctx: &tropical_gemm_cuda::CudaContext,
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
     a: &[K::Scalar],
     b: &[K::Scalar],
     batch: usize,
@@ -753,30 +1265,20 @@ where
     K: tropical_gemm_cuda::CudaKernel,
     K::Scalar: cudarc::driver::DeviceRepr + Default + Clone + cudarc::driver::ValidAsZeroBits,
 {
-    use tropical_gemm_cuda::{tropical_gemm_gpu, GpuMatrix};
-
-    let (a_stride, b_stride, c_stride) = (m * k, k * n, m * n);
-    let mut out = vec![K::Scalar::default(); batch * c_stride];
-
-    for i in 0..batch {
-        let a_gpu = GpuMatrix::from_host(ctx, &a[i * a_stride..(i + 1) * a_stride], m, k)
-            .expect("upload tropical GEMM operand A");
-        let b_gpu = GpuMatrix::from_host(ctx, &b[i * b_stride..(i + 1) * b_stride], k, n)
-            .expect("upload tropical GEMM operand B");
-        let mut c_gpu = GpuMatrix::alloc(ctx, m, n).expect("alloc tropical GEMM output");
-        tropical_gemm_gpu::<K>(ctx, &a_gpu, &b_gpu, &mut c_gpu).expect("tropical GEMM kernel");
-        let c_host = c_gpu.to_host(ctx).expect("download tropical GEMM output");
-        out[i * c_stride..(i + 1) * c_stride].copy_from_slice(&c_host);
-    }
-    out
+    let a_dev = stream.clone_htod(a).expect("upload tropical GEMM batch A");
+    let b_dev = stream.clone_htod(b).expect("upload tropical GEMM batch B");
+    let c_dev = batched_tropical_gemm_dev::<K>(ctx, stream, &a_dev, &b_dev, batch, m, k, n);
+    stream
+        .clone_dtoh(&c_dev)
+        .expect("download tropical GEMM batch C")
 }
 
-/// Argmax-tracking counterpart of [`batched_tropical_gemm`]: runs the per-batch
-/// tropical GEMM with winner tracking, returning the result and the argmax
-/// `k`-indices (both `batch × (m × n)` column-major).
+/// Host-buffer wrapper over [`batched_tropical_gemm_dev_with_argmax`].
 #[cfg(feature = "cuda-tropical")]
+#[allow(clippy::too_many_arguments)]
 fn batched_tropical_gemm_with_argmax<K>(
     ctx: &tropical_gemm_cuda::CudaContext,
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
     a: &[K::Scalar],
     b: &[K::Scalar],
     batch: usize,
@@ -788,29 +1290,16 @@ where
     K: tropical_gemm_cuda::CudaKernelWithArgmax,
     K::Scalar: cudarc::driver::DeviceRepr + Default + Clone + cudarc::driver::ValidAsZeroBits,
 {
-    use tropical_gemm_cuda::{tropical_gemm_gpu_with_argmax, GpuMatrix, GpuMatrixWithArgmax};
-
-    let (a_stride, b_stride, c_stride) = (m * k, k * n, m * n);
-    let mut out = vec![K::Scalar::default(); batch * c_stride];
-    let mut argmax = vec![0u32; batch * c_stride];
-
-    for i in 0..batch {
-        let a_gpu = GpuMatrix::from_host(ctx, &a[i * a_stride..(i + 1) * a_stride], m, k)
-            .expect("upload tropical GEMM operand A");
-        let b_gpu = GpuMatrix::from_host(ctx, &b[i * b_stride..(i + 1) * b_stride], k, n)
-            .expect("upload tropical GEMM operand B");
-        let mut c_gpu = GpuMatrixWithArgmax::alloc(ctx, m, n).expect("alloc tropical GEMM output");
-        tropical_gemm_gpu_with_argmax::<K>(ctx, &a_gpu, &b_gpu, &mut c_gpu)
-            .expect("tropical GEMM argmax kernel");
-        let c_host = c_gpu
-            .matrix_to_host(ctx)
-            .expect("download tropical GEMM output");
-        let argmax_host = c_gpu
-            .argmax_to_host(ctx)
-            .expect("download tropical GEMM argmax");
-        out[i * c_stride..(i + 1) * c_stride].copy_from_slice(&c_host);
-        argmax[i * c_stride..(i + 1) * c_stride].copy_from_slice(&argmax_host);
-    }
+    let a_dev = stream.clone_htod(a).expect("upload tropical GEMM batch A");
+    let b_dev = stream.clone_htod(b).expect("upload tropical GEMM batch B");
+    let (c_dev, argmax_dev) =
+        batched_tropical_gemm_dev_with_argmax::<K>(ctx, stream, &a_dev, &b_dev, batch, m, k, n);
+    let out = stream
+        .clone_dtoh(&c_dev)
+        .expect("download tropical GEMM batch C");
+    let argmax = stream
+        .clone_dtoh(&argmax_dev)
+        .expect("download tropical GEMM batch argmax");
     (out, argmax)
 }
 
