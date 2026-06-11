@@ -605,7 +605,13 @@ impl Cuda {
     /// same column-major strided-view semantics as [`device_gather`]; outputs are
     /// allocated uninitialised (the kernel writes every element). Works for
     /// arbitrary dimensions; element width (32/64-bit) selected by `T` as above.
+    ///
+    /// Kept (and unit-tested) as a primitive for a future large-`k` cross-node
+    /// batching: at the per-node k=2 granularity it was a measured regression
+    /// (its metadata uploads outweigh the single saved launch — B9), so the
+    /// contraction path does not call it yet.
     #[cfg(feature = "cuda-tropical")]
+    #[allow(dead_code)]
     fn device_gather_batched<T>(
         &self,
         reqs: &[(&cudarc::driver::CudaSlice<T>, &[usize], &[usize])],
@@ -908,33 +914,25 @@ impl Cuda {
                     unsafe { std::mem::transmute(b.slice()) };
                 // Skip the operand gather when it would copy the input verbatim
                 // (canonical layout already): one fewer launch + alloc per node.
+                // NB: batching the A+B pair into one launch (device_gather_batched)
+                // was a measured net regression at this k=2 granularity — its extra
+                // metadata uploads outweigh the single saved launch (B9 Log). The
+                // batched primitive is kept for a future large-k (cross-node) use.
                 let a_numel: usize = a_new_shape.iter().product();
+                let a_canon = if is_identity_gather(&a_new_shape, &a_src_strides)
+                    && a_slice.len() == a_numel
+                {
+                    None
+                } else {
+                    Some(self.device_gather::<$scalar>(a_slice, &a_new_shape, &a_src_strides))
+                };
                 let b_numel: usize = b_new_shape.iter().product();
-                let a_id = is_identity_gather(&a_new_shape, &a_src_strides) && a_slice.len() == a_numel;
-                let b_id = is_identity_gather(&b_new_shape, &b_src_strides) && b_slice.len() == b_numel;
-                // When BOTH operands need a real gather, do them in one launch
-                // (the per-node A+B pair is the bulk of the gather launches that
-                // make this regime launch-bound); otherwise gather the single
-                // non-identity operand directly (no batching overhead).
-                let (a_canon, b_canon) = match (a_id, b_id) {
-                    (true, true) => (None, None),
-                    (false, true) => (
-                        Some(self.device_gather::<$scalar>(a_slice, &a_new_shape, &a_src_strides)),
-                        None,
-                    ),
-                    (true, false) => (
-                        None,
-                        Some(self.device_gather::<$scalar>(b_slice, &b_new_shape, &b_src_strides)),
-                    ),
-                    (false, false) => {
-                        let mut outs = self.device_gather_batched::<$scalar>(&[
-                            (a_slice, a_new_shape.as_slice(), a_src_strides.as_slice()),
-                            (b_slice, b_new_shape.as_slice(), b_src_strides.as_slice()),
-                        ]);
-                        let b_out = outs.pop().unwrap();
-                        let a_out = outs.pop().unwrap();
-                        (Some(a_out), Some(b_out))
-                    }
+                let b_canon = if is_identity_gather(&b_new_shape, &b_src_strides)
+                    && b_slice.len() == b_numel
+                {
+                    None
+                } else {
+                    Some(self.device_gather::<$scalar>(b_slice, &b_new_shape, &b_src_strides))
                 };
                 let c_canon = batched_tropical_gemm_dev::<$kernel>(
                     &tctx,
