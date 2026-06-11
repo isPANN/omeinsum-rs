@@ -1144,11 +1144,16 @@ fn permute_tropical_output<T: Copy + Default>(
 }
 
 /// Device-resident core of the canonical column-major (batched) tropical GEMM:
-/// operands are already on the GPU, and the result stays on the GPU. Each slice
-/// is wrapped zero-host-roundtrip via an on-device `clone_dtod` +
-/// [`GpuMatrix::from_cuda_slice`] and assembled into the output with
-/// `memcpy_dtod`. `K` selects the concrete semiring × scalar kernel. Shared by
-/// the device contraction path and the host-buffer wrapper below.
+/// operands are already on the GPU, and the result stays on the GPU. The whole
+/// batch runs in a *single* strided-batched kernel launch
+/// ([`CudaKernel::launch_gemm_batched`], `blockIdx.z` = batch element) directly
+/// over the contiguous `a_dev`/`b_dev` buffers — no per-slice `clone_dtod`, no
+/// per-slice allocation, no reassembly `memcpy_dtod`. The output is allocated
+/// *uninitialized* (`alloc`, not `alloc_zeros`): the GEMM kernel fully writes
+/// every `batch·m·n` element, so zeroing it would be wasted work (≈16 GB of
+/// memset on the large KSG networks). `K` selects the concrete semiring ×
+/// scalar kernel. Shared by the device contraction path and the host-buffer
+/// wrapper below.
 #[cfg(feature = "cuda-tropical")]
 #[allow(clippy::too_many_arguments)]
 fn batched_tropical_gemm_dev<K>(
@@ -1165,36 +1170,14 @@ where
     K: tropical_gemm_cuda::CudaKernel,
     K::Scalar: cudarc::driver::DeviceRepr + Default + Clone + cudarc::driver::ValidAsZeroBits,
 {
-    use tropical_gemm_cuda::{tropical_gemm_gpu, GpuMatrix};
-
-    let (a_stride, b_stride, c_stride) = (m * k, k * n, m * n);
-    let mut c_dev = stream
-        .alloc_zeros::<K::Scalar>(batch * c_stride)
+    let c_stride = m * n;
+    // Uninitialized: the batched kernel writes every element of C. Safe because
+    // the launch is enqueued on the same stream before any reader (stream
+    // ordering), and the only host read goes through a synchronizing download.
+    let mut c_dev = unsafe { stream.alloc::<K::Scalar>(batch * c_stride) }
         .expect("alloc tropical GEMM batch C");
-
-    for i in 0..batch {
-        // Own a device copy of each slice (no host transfer) to hand to the
-        // GEMM, which takes ownership of its operand allocations.
-        let a_i = stream
-            .clone_dtod(&a_dev.slice(i * a_stride..(i + 1) * a_stride))
-            .expect("slice tropical GEMM operand A");
-        let b_i = stream
-            .clone_dtod(&b_dev.slice(i * b_stride..(i + 1) * b_stride))
-            .expect("slice tropical GEMM operand B");
-        let a_gpu =
-            GpuMatrix::from_cuda_slice(ctx, a_i, m, k).expect("wrap tropical GEMM operand A");
-        let b_gpu =
-            GpuMatrix::from_cuda_slice(ctx, b_i, k, n).expect("wrap tropical GEMM operand B");
-        let mut c_gpu = GpuMatrix::alloc(ctx, m, n).expect("alloc tropical GEMM output");
-        tropical_gemm_gpu::<K>(ctx, &a_gpu, &b_gpu, &mut c_gpu).expect("tropical GEMM kernel");
-        let c_i = c_gpu.into_inner();
-        let mut dst = c_dev
-            .try_slice_mut(i * c_stride..(i + 1) * c_stride)
-            .expect("slice tropical GEMM output");
-        stream
-            .memcpy_dtod(&c_i, &mut dst)
-            .expect("assemble tropical GEMM output on device");
-    }
+    K::launch_gemm_batched(ctx, a_dev, b_dev, &mut c_dev, batch, m, k, n)
+        .expect("batched tropical GEMM kernel");
     c_dev
 }
 

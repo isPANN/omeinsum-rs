@@ -33,17 +33,18 @@ omeco = "0.2.4"
 # (otherwise `TropicalMaxPlus<f32>` from crates.io is a distinct, incompatible
 # type). The root API used by the CPU path is identical across the two sources.
 #
-# Branch `perf/cuda-async-launch` = `main` + the async-launch fix (TensorBFS PR
-# #60). We use this instead of `feat/cuda-andor-gpu` because that branch was just
-# `main` + the TropicalAndOr/Bitwise/K-pack work (#44), none of which this crate
-# uses (only MaxPlus/MinPlus/MaxMul). Repin to `main` once #60 merges.
-tropical-gemm = { git = "https://github.com/TensorBFS/tropical-gemm", branch = "perf/cuda-async-launch", optional = true }
+# Branch `perf/forward-batched-gemm` = `perf/cuda-async-launch` (= `main` + the
+# async-launch fix, TensorBFS PR #60) + the forward strided-batched tropical GEMM
+# kernel (`CudaKernel::launch_gemm_batched`), which the CUDA device path below
+# uses to run a whole contraction node's batch in one launch. Repin down to
+# `perf/cuda-async-launch` / `main` as those merge upstream.
+tropical-gemm = { git = "https://github.com/TensorBFS/tropical-gemm", branch = "perf/forward-batched-gemm", optional = true }
 
 # Optional: CUDA support
 # tropical-gemm-cuda pinned to the same branch (column-major host API +
 # device-resident from_cuda_slice / CudaContext::from_device not yet on crates.io
-# 0.2.0, plus the async-launch fix). See the note above.
-tropical-gemm-cuda = { git = "https://github.com/TensorBFS/tropical-gemm", branch = "perf/cuda-async-launch", optional = true }
+# 0.2.0, plus the async-launch fix and the forward batched kernel). See above.
+tropical-gemm-cuda = { git = "https://github.com/TensorBFS/tropical-gemm", branch = "perf/forward-batched-gemm", optional = true }
 # cudarc 0.19.x is required to share a device zero-copy with tropical-gemm-cuda
 # (pre-1.0 semver: the exact minor must match the dep's). Feature set mirrors the
 # dep so cargo unifies them into a single build.
