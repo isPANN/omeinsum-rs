@@ -465,6 +465,10 @@ impl Cuda {
         use cudarc::driver::{LaunchConfig, PushKernelArg};
 
         let numel: usize = new_shape.iter().product();
+        // Diagnostic only (env-gated, zero cost when off): record the executed
+        // gather's (new_shape, src_strides) to study whether fusing the gather into
+        // the GEMM would keep coalesced loads (inner axis src-stride 1) — see B9.
+        record_gather_stat(new_shape, src_strides, numel);
         // Uninitialized: the gather kernel writes out[o] for every o in 0..numel
         // (grid sized via `for_num_elems(numel)`, with an `o >= numel` guard), so
         // every element of the output is overwritten before any reader — zeroing
@@ -1133,6 +1137,51 @@ impl Cuda {
 /// `new_shape[i] = shape[perm[i]]`, `src_strides[i] = strides[perm[i]]`. This is
 /// the device-side counterpart of the host `materialize_strided`'s indexing.
 #[cfg(feature = "cuda-tropical")]
+/// Diagnostic (B9): when `MISO_GATHER_STATS` is set to a file path, accumulate a
+/// histogram of every executed device gather's `(new_shape, src_strides)` and
+/// rewrite the file (whole histogram, sorted) whenever a new pattern appears or
+/// every 4096 calls — so the final state after a run is complete. Records
+/// `inner_contig` = whether the innermost (fastest-varying, output-stride-1) axis
+/// is also stride-1 in the *source* (`src_strides[0] == 1`), the make-or-break
+/// condition for fusing the gather into the GEMM with coalesced loads. Zero cost
+/// when the env var is unset (early return before any locking).
+#[cfg(feature = "cuda-tropical")]
+fn record_gather_stat(new_shape: &[usize], src_strides: &[usize], numel: usize) {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static STATS: OnceLock<Mutex<(HashMap<(Vec<usize>, Vec<usize>), (u64, u64)>, u64)>> =
+        OnceLock::new();
+    let path = match std::env::var("MISO_GATHER_STATS") {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let cell = STATS.get_or_init(|| Mutex::new((HashMap::new(), 0)));
+    let mut g = cell.lock().unwrap();
+    let key = (new_shape.to_vec(), src_strides.to_vec());
+    let is_new = !g.0.contains_key(&key);
+    let e = g.0.entry(key).or_insert((0, 0));
+    e.0 += 1;
+    e.1 += numel as u64;
+    g.1 += 1;
+    if is_new || g.1 % 4096 == 0 {
+        let mut lines: Vec<String> = g
+            .0
+            .iter()
+            .map(|((ns, ss), (cnt, nm))| {
+                let inner_contig = ss.first() == Some(&1);
+                format!(
+                    "count={cnt}\tnumel_sum={nm}\tinner_contig={inner_contig}\tndim={}\tnew_shape={ns:?}\tsrc_strides={ss:?}",
+                    ns.len()
+                )
+            })
+            .collect();
+        lines.sort();
+        let total_calls = g.1;
+        let header = format!("# total_gather_calls={total_calls} unique_patterns={}", g.0.len());
+        let _ = std::fs::write(&path, format!("{header}\n{}\n", lines.join("\n")));
+    }
+}
+
 fn canonical_gather_args(
     perm: &[usize],
     shape: &[usize],
