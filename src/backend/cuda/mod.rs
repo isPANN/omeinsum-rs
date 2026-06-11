@@ -266,15 +266,13 @@ pub struct Cuda {
     /// don't overwrite the shared buffer between each other's upload and kernel
     /// (they serialize on the single stream regardless), and the buffers persist
     /// in the map so a kernel reading them is never freed out from under it.
+    ///
+    /// One combined `2·ndim` buffer per rank — `[shape (ndim) ‖ strides (ndim)]` —
+    /// so each gather uploads its metadata in a single `memcpy_htod` (one HtoD
+    /// instead of two); the kernel reads `shape` and `strides` as two non-
+    /// overlapping sub-views of the one buffer.
     #[cfg(feature = "cuda-tropical")]
-    gather_meta: Arc<
-        Mutex<
-            std::collections::HashMap<
-                usize,
-                (cudarc::driver::CudaSlice<i64>, cudarc::driver::CudaSlice<i64>),
-            >,
-        >,
-    >,
+    gather_meta: Arc<Mutex<std::collections::HashMap<usize, cudarc::driver::CudaSlice<i64>>>>,
 }
 
 /// Device strided-gather kernels: `out[o] = in[Σ coord_ax · src_strides[ax]]`,
@@ -479,8 +477,10 @@ impl Cuda {
             return out;
         }
 
-        let shape_i64: Vec<i64> = new_shape.iter().map(|&x| x as i64).collect();
-        let strides_i64: Vec<i64> = src_strides.iter().map(|&x| x as i64).collect();
+        // One combined upload: [shape (ndim) ‖ strides (ndim)].
+        let mut combined: Vec<i64> = Vec::with_capacity(2 * new_shape.len());
+        combined.extend(new_shape.iter().map(|&x| x as i64));
+        combined.extend(src_strides.iter().map(|&x| x as i64));
         let ndim_us = new_shape.len();
         let ndim = ndim_us as i32;
         let numel_i64 = numel as i64;
@@ -502,31 +502,27 @@ impl Cuda {
         // the enqueued kernel never reads a freed allocation.
         let mut meta = self.gather_meta.lock().unwrap();
         if !meta.contains_key(&ndim_us) {
-            let s = self
+            let buf = self
                 .stream
-                .alloc_zeros::<i64>(ndim_us)
-                .expect("alloc gather shape scratch");
-            let t = self
-                .stream
-                .alloc_zeros::<i64>(ndim_us)
-                .expect("alloc gather strides scratch");
-            meta.insert(ndim_us, (s, t));
+                .alloc_zeros::<i64>(2 * ndim_us)
+                .expect("alloc gather metadata scratch");
+            meta.insert(ndim_us, buf);
         }
-        let (d_shape, d_strides) = meta.get_mut(&ndim_us).unwrap();
+        let d_combined = meta.get_mut(&ndim_us).unwrap();
         self.stream
-            .memcpy_htod(&shape_i64, d_shape)
-            .expect("upload gather shape");
-        self.stream
-            .memcpy_htod(&strides_i64, d_strides)
-            .expect("upload gather strides");
+            .memcpy_htod(&combined, d_combined)
+            .expect("upload gather metadata");
+        // Two non-overlapping sub-views of the one buffer: shape then strides.
+        let d_shape = d_combined.slice(0..ndim_us);
+        let d_strides = d_combined.slice(ndim_us..2 * ndim_us);
 
         let mut builder = self.stream.launch_builder(&func);
         builder
             .arg(&mut out)
             .arg(input)
             .arg(&ndim)
-            .arg(&*d_shape)
-            .arg(&*d_strides)
+            .arg(&d_shape)
+            .arg(&d_strides)
             .arg(&numel_i64);
         unsafe { builder.launch(cfg) }.expect("launch device gather kernel");
         drop(meta);
@@ -748,10 +744,33 @@ impl Cuda {
                     unsafe { std::mem::transmute(a.slice()) };
                 let b_slice: &cudarc::driver::CudaSlice<$scalar> =
                     unsafe { std::mem::transmute(b.slice()) };
-                let a_canon = self.device_gather::<$scalar>(a_slice, &a_new_shape, &a_src_strides);
-                let b_canon = self.device_gather::<$scalar>(b_slice, &b_new_shape, &b_src_strides);
+                // Skip the operand gather when it would copy the input verbatim
+                // (canonical layout already): one fewer launch + alloc per node.
+                let a_numel: usize = a_new_shape.iter().product();
+                let a_canon = if is_identity_gather(&a_new_shape, &a_src_strides)
+                    && a_slice.len() == a_numel
+                {
+                    None
+                } else {
+                    Some(self.device_gather::<$scalar>(a_slice, &a_new_shape, &a_src_strides))
+                };
+                let b_numel: usize = b_new_shape.iter().product();
+                let b_canon = if is_identity_gather(&b_new_shape, &b_src_strides)
+                    && b_slice.len() == b_numel
+                {
+                    None
+                } else {
+                    Some(self.device_gather::<$scalar>(b_slice, &b_new_shape, &b_src_strides))
+                };
                 let c_canon = batched_tropical_gemm_dev::<$kernel>(
-                    &tctx, stream, &a_canon, &b_canon, batch, left, contract, right,
+                    &tctx,
+                    stream,
+                    a_canon.as_ref().unwrap_or(a_slice),
+                    b_canon.as_ref().unwrap_or(b_slice),
+                    batch,
+                    left,
+                    contract,
+                    right,
                 );
                 let c_final = match &out_gather {
                     None => c_canon,
@@ -1122,6 +1141,21 @@ fn canonical_gather_args(
     let new_shape = perm.iter().map(|&p| shape[p]).collect();
     let src_strides = perm.iter().map(|&p| strides[p]).collect();
     (new_shape, src_strides)
+}
+
+/// True when a `device_gather(new_shape, src_strides)` would copy its input
+/// verbatim — i.e. `src_strides` already equals the contiguous column-major
+/// strides of `new_shape`, so `out[o] == in[o]` for every element. In that case
+/// the gather is a pure no-op copy and the caller can feed the input slice
+/// straight to the GEMM, skipping one kernel launch (and one output alloc) per
+/// skipped operand. This is the common case for operands already laid out in
+/// contraction-canonical order. The caller must additionally check that the
+/// input length equals the gather's element count, since a no-op gather over a
+/// *prefix* of a longer buffer still differs from passing the whole buffer.
+#[cfg(feature = "cuda-tropical")]
+fn is_identity_gather(new_shape: &[usize], src_strides: &[usize]) -> bool {
+    use crate::tensor::compute_contiguous_strides;
+    src_strides == compute_contiguous_strides(new_shape).as_slice()
 }
 
 /// `(new_shape, src_strides)` for the device output permute, or `None` when the

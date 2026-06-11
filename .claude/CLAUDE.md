@@ -64,3 +64,18 @@ Repo-local skills live under `.claude/skills/*/SKILL.md`.
 - `review-quality` - read-only review checklist for DRY, KISS, correctness, and test quality
 - `fix-pr` - workflow for addressing PR comments, CI failures, and missing coverage
 - `release` - prepare, verify, tag, and publish a crate release
+
+## Experiments (runscribe)
+
+Experiments in this repo are logged with [runscribe](https://github.com/isPANN/runscribe), organized as **goal → hypothesis → run** (a goal is a single letter `A`; a hypothesis is `A1`, `A2`; runs are timestamped under their hypothesis).
+
+- **Never run an experiment bare.** Wrap every experiment:
+  `runscribe run --hyp <code> [--tag <tag>] -- <command>` (any language) or
+  `with runscribe.run(hyp="<code>", tag="<tag>") as r: ...` (in-process Python; `r` is how you call `r.log_metric(...)`).
+- **Declare goal, open hypothesis, then bind.** `runscribe goal new <handle> -m "..."` → letter `A`; `runscribe hyp new A --from <parent> -m "..."` → `A1`; then bind runs with `--hyp A1`. `--from` is required — the goal (`A`) for a fresh line or a prior hypothesis (`A1`) it builds on; this records the exploration map. `--hyp` must reference an **already-existing** hypothesis; an unknown code is an error, so declare it before binding.
+- **Two gates keep the human in control.** Before running, the agent argues the path in the hypothesis's `## Why this path` section (research-paper style: motivation → the specific unknown → the proposed path) and waits for a go-ahead. After a run, the agent records an *observation* plus its own attempt to refute it and the strongest surviving alternative — never a bare verdict — and leaves the judgment to the human.
+- **Name slugs deliberately** (tag, goal handle, hypothesis title all become directory names). Use short ASCII kebab-case. The `--tag` should encode the one variable that distinguishes a run within its hypothesis (`n200`, `sor`, `int8`) so the `runs/` listing reads like a results table; the goal handle is a 2–4 word domain noun (`kv-cache-quant`); the hypothesis title is one short testable claim, not a topic.
+- **Report the run directory** (`[runscribe] recorded → …`) alongside any result. No bare metrics.
+- **Performance:** runscribe records measurements; you do the timing yourself. Call `log_metric` with aggregated results *outside* timed regions; `log_tensor` stays metadata-only. Keep runscribe calls out of hot loops.
+- **Read & log helpers.** `runscribe hyp list [<goal>]` prints the goal→hypothesis tree (lineage + latest result) — use it to pick a `--from` parent. `runscribe show <hyp>` tables every run under a hypothesis for trend comparison. `runscribe note <hyp> -m "..."` appends a timestamped bullet to the hypothesis's `## Log` (handy for thoughts in flight; leaves the gated sections alone).
+- **Rebuild tables** with `runscribe index`. Never hand-edit `runscribe/**/INDEX.md`.
