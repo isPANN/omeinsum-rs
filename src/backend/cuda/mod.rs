@@ -228,20 +228,33 @@ impl<T> From<CudaComplex<T>> for Complex<T> {
 pub struct Cuda {
     ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
+    //
+    // The kernel/plan caches below are wrapped in `Arc` so that `Cuda::clone()`
+    // *shares* them rather than resetting them. omeinsum's `Tensor<T, B>` owns its
+    // backend and clones it on every operation (so each contraction node gets a
+    // cloned backend); if clone produced empty caches, every node would rebuild
+    // the `tropical-gemm-cuda` context and the permute module — each an NVRTC
+    // `compile_ptx` recompile of the CUDA kernels — making compilation, not
+    // compute, dominate the wall (~34 ms/node). Sharing via `Arc` makes the
+    // NVRTC compile happen once per process. The inner `Mutex` still guards
+    // concurrent access; each is held only long enough to hand out an `Arc`
+    // clone, so contractions are not serialized on it.
     #[cfg(feature = "cuda")]
-    handle: Mutex<Option<Handle>>,
+    handle: Arc<Mutex<Option<Handle>>>,
     #[cfg(feature = "cuda")]
-    cache: Mutex<PlanCache>,
+    cache: Arc<Mutex<PlanCache>>,
     /// `tropical-gemm-cuda` context built once from the shared CUDA device and
-    /// reused across contraction nodes, instead of rebuilt (which reloads the
-    /// kernel module) on every tropical GEMM. Lazily initialized on first use.
+    /// reused across contraction nodes (and across backend clones), instead of
+    /// rebuilt (which reloads/recompiles the kernel module) on every tropical
+    /// GEMM. Lazily initialized on first use.
     #[cfg(feature = "cuda-tropical")]
-    tropical_ctx: Mutex<Option<Arc<tropical_gemm_cuda::CudaContext>>>,
+    tropical_ctx: Arc<Mutex<Option<Arc<tropical_gemm_cuda::CudaContext>>>>,
     /// NVRTC-compiled module holding the device strided-gather kernels
     /// (`gather32`/`gather64`) used for on-device operand canonicalization and
-    /// output permutation. Compiled once and cached, never per contraction.
+    /// output permutation. Compiled once and cached (shared across clones),
+    /// never per contraction.
     #[cfg(feature = "cuda-tropical")]
-    permute_module: Mutex<Option<Arc<cudarc::driver::CudaModule>>>,
+    permute_module: Arc<Mutex<Option<Arc<cudarc::driver::CudaModule>>>>,
 }
 
 /// Device strided-gather kernels: `out[o] = in[Σ coord_ax · src_strides[ax]]`,
@@ -289,19 +302,22 @@ unsafe impl Sync for Cuda {}
 
 impl Clone for Cuda {
     fn clone(&self) -> Self {
-        // Create a new Cuda instance sharing the same device/stream
-        // but with fresh handle and cache (lazy initialization).
+        // Share the same device/stream AND the same kernel/plan caches. Cloning
+        // the `Arc`s (rather than reinitializing to empty) is what keeps the
+        // NVRTC kernel compilation a once-per-process cost: every per-node
+        // backend clone now reuses the already-compiled tropical-gemm context
+        // and permute module instead of recompiling them.
         Self {
             ctx: self.ctx.clone(),
             stream: self.stream.clone(),
             #[cfg(feature = "cuda")]
-            handle: Mutex::new(None),
+            handle: self.handle.clone(),
             #[cfg(feature = "cuda")]
-            cache: Mutex::new(PlanCache::new(64)),
+            cache: self.cache.clone(),
             #[cfg(feature = "cuda-tropical")]
-            tropical_ctx: Mutex::new(None),
+            tropical_ctx: self.tropical_ctx.clone(),
             #[cfg(feature = "cuda-tropical")]
-            permute_module: Mutex::new(None),
+            permute_module: self.permute_module.clone(),
         }
     }
 }
@@ -333,13 +349,13 @@ impl Cuda {
             ctx,
             stream,
             #[cfg(feature = "cuda")]
-            handle: Mutex::new(None),
+            handle: Arc::new(Mutex::new(None)),
             #[cfg(feature = "cuda")]
-            cache: Mutex::new(PlanCache::new(64)),
+            cache: Arc::new(Mutex::new(PlanCache::new(64))),
             #[cfg(feature = "cuda-tropical")]
-            tropical_ctx: Mutex::new(None),
+            tropical_ctx: Arc::new(Mutex::new(None)),
             #[cfg(feature = "cuda-tropical")]
-            permute_module: Mutex::new(None),
+            permute_module: Arc::new(Mutex::new(None)),
         })
     }
 
