@@ -310,6 +310,67 @@ extern "C" __global__ void gather64(unsigned long long* out, const unsigned long
     }
     out[o] = in[src];
 }
+
+// Batched gather: one launch performs `k` independent strided gathers (the
+// "grouped/segmented batched" pattern used by cuBLAS grouped-GEMM / MAGMA
+// vbatch — the standard way to kill per-launch overhead for many tiny ops).
+// `out_ptrs[i]`/`in_ptrs[i]` are the i-th gather's device buffers (array of
+// pointers, as in `cublas*gemmBatched`). `meta` packs, per gather and pointed at
+// by `meta_off[i]`: `[ndim_i, new_shape_i[ndim_i], src_strides_i[ndim_i]]`.
+// `prefix` is the (k+1)-entry prefix sum of output element counts; `total =
+// prefix[k]`. A grid-stride loop over the flattened work range gives even load
+// balance across gathers of very different sizes; a per-element binary search
+// over `prefix` maps the flat index to its gather. Generic over element width
+// (32/64-bit) exactly like the single-gather kernels above; works for arbitrary
+// dimensions (no power-of-two assumption).
+extern "C" __global__ void gather_batched32(unsigned long long* out_ptrs,
+                                            const unsigned long long* in_ptrs,
+                                            const long long* meta, const long long* meta_off,
+                                            const long long* prefix, int k, long long total) {
+    long long stride = (long long)gridDim.x * blockDim.x;
+    for (long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x; g < total; g += stride) {
+        int lo = 0, hi = k;
+        while (lo + 1 < hi) { int mid = (lo + hi) >> 1; if (prefix[mid] <= g) lo = mid; else hi = mid; }
+        long long o = g - prefix[lo];
+        const long long* m = meta + meta_off[lo];
+        int ndim = (int)m[0];
+        const long long* new_shape = m + 1;
+        const long long* src_strides = m + 1 + ndim;
+        long long rem = o, src = 0;
+        for (int ax = 0; ax < ndim; ++ax) {
+            long long c = rem % new_shape[ax];
+            rem /= new_shape[ax];
+            src += c * src_strides[ax];
+        }
+        unsigned int* out = (unsigned int*)out_ptrs[lo];
+        const unsigned int* in = (const unsigned int*)in_ptrs[lo];
+        out[o] = in[src];
+    }
+}
+extern "C" __global__ void gather_batched64(unsigned long long* out_ptrs,
+                                            const unsigned long long* in_ptrs,
+                                            const long long* meta, const long long* meta_off,
+                                            const long long* prefix, int k, long long total) {
+    long long stride = (long long)gridDim.x * blockDim.x;
+    for (long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x; g < total; g += stride) {
+        int lo = 0, hi = k;
+        while (lo + 1 < hi) { int mid = (lo + hi) >> 1; if (prefix[mid] <= g) lo = mid; else hi = mid; }
+        long long o = g - prefix[lo];
+        const long long* m = meta + meta_off[lo];
+        int ndim = (int)m[0];
+        const long long* new_shape = m + 1;
+        const long long* src_strides = m + 1 + ndim;
+        long long rem = o, src = 0;
+        for (int ax = 0; ax < ndim; ++ax) {
+            long long c = rem % new_shape[ax];
+            rem /= new_shape[ax];
+            src += c * src_strides[ax];
+        }
+        unsigned long long* out = (unsigned long long*)out_ptrs[lo];
+        const unsigned long long* in = (const unsigned long long*)in_ptrs[lo];
+        out[o] = in[src];
+    }
+}
 "#;
 
 // SAFETY: Cuda is Send because all fields are Send.
@@ -531,6 +592,103 @@ impl Cuda {
         unsafe { builder.launch(cfg) }.expect("launch device gather kernel");
         drop(meta);
         out
+    }
+
+    /// Batched counterpart of [`device_gather`]: perform `reqs.len()` independent
+    /// strided gathers in a **single** kernel launch, returning one fresh
+    /// contiguous output buffer per request. This is the grouped/segmented
+    /// batched pattern (cuBLAS grouped-GEMM / MAGMA vbatch): the operands are
+    /// passed as an array of device pointers (like `cublas*gemmBatched`) and the
+    /// flattened output work range is split by a prefix sum, so one launch
+    /// replaces N per-node gather launches — the lever against the launch-bound
+    /// dispatch cost. Each request is `(input, new_shape, src_strides)` with the
+    /// same column-major strided-view semantics as [`device_gather`]; outputs are
+    /// allocated uninitialised (the kernel writes every element). Works for
+    /// arbitrary dimensions; element width (32/64-bit) selected by `T` as above.
+    #[cfg(feature = "cuda-tropical")]
+    fn device_gather_batched<T>(
+        &self,
+        reqs: &[(&cudarc::driver::CudaSlice<T>, &[usize], &[usize])],
+    ) -> Vec<cudarc::driver::CudaSlice<T>>
+    where
+        T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default + Clone,
+    {
+        use cudarc::driver::{DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg};
+
+        let k = reqs.len();
+        let numels: Vec<usize> = reqs.iter().map(|(_, sh, _)| sh.iter().product()).collect();
+        let mut outs: Vec<cudarc::driver::CudaSlice<T>> = numels
+            .iter()
+            .map(|&n| {
+                unsafe { self.stream.alloc::<T>(n.max(1)) }.expect("alloc batched gather output")
+            })
+            .collect();
+
+        // Prefix sum of output element counts (k+1 entries); total = prefix[k].
+        let mut prefix: Vec<i64> = Vec::with_capacity(k + 1);
+        prefix.push(0);
+        for &n in &numels {
+            let last = *prefix.last().unwrap();
+            prefix.push(last + n as i64);
+        }
+        let total = *prefix.last().unwrap();
+        if total == 0 {
+            return outs;
+        }
+
+        // Pack per-gather metadata [ndim, shape.., strides..] with an offset table.
+        let mut meta: Vec<i64> = Vec::new();
+        let mut meta_off: Vec<i64> = Vec::with_capacity(k);
+        for (_, sh, ss) in reqs {
+            meta_off.push(meta.len() as i64);
+            meta.push(sh.len() as i64);
+            meta.extend(sh.iter().map(|&x| x as i64));
+            meta.extend(ss.iter().map(|&x| x as i64));
+        }
+
+        // Array-of-pointers: collect each operand's device address. The Record
+        // guards (cheap event-record on drop, not a stream sync) are held until
+        // after the launch is enqueued.
+        let mut in_guards = Vec::with_capacity(k);
+        let mut out_guards = Vec::with_capacity(k);
+        let mut in_ptrs: Vec<u64> = Vec::with_capacity(k);
+        let mut out_ptrs: Vec<u64> = Vec::with_capacity(k);
+        for ((inp, _, _), out) in reqs.iter().zip(outs.iter_mut()) {
+            let (ip, ig) = inp.device_ptr(&self.stream);
+            in_ptrs.push(ip);
+            in_guards.push(ig);
+            let (op, og) = out.device_ptr_mut(&self.stream);
+            out_ptrs.push(op);
+            out_guards.push(og);
+        }
+
+        let d_in = self.stream.memcpy_stod(&in_ptrs).expect("upload gather in ptrs");
+        let d_out = self.stream.memcpy_stod(&out_ptrs).expect("upload gather out ptrs");
+        let d_meta = self.stream.memcpy_stod(&meta).expect("upload gather meta");
+        let d_off = self.stream.memcpy_stod(&meta_off).expect("upload gather meta_off");
+        let d_prefix = self.stream.memcpy_stod(&prefix).expect("upload gather prefix");
+
+        let fname = match std::mem::size_of::<T>() {
+            4 => "gather_batched32",
+            8 => "gather_batched64",
+            other => panic!("device_gather_batched: unsupported element width {other} bytes"),
+        };
+        let func = self.permute_function(fname);
+        let cfg = LaunchConfig::for_num_elems(total as u32);
+        let k_i32 = k as i32;
+        let mut builder = self.stream.launch_builder(&func);
+        builder
+            .arg(&d_out)
+            .arg(&d_in)
+            .arg(&d_meta)
+            .arg(&d_off)
+            .arg(&d_prefix)
+            .arg(&k_i32)
+            .arg(&total);
+        unsafe { builder.launch(cfg) }.expect("launch batched gather kernel");
+        drop(in_guards);
+        drop(out_guards);
+        outs
     }
 
     /// Perform a tensor contraction using cuTENSOR.
@@ -1894,5 +2052,123 @@ impl Backend for Cuda {
              (MaxPlus/MinPlus/MaxMul) via the `cuda-tropical` feature; cuTENSOR \
              does not provide argmax tracking."
         );
+    }
+}
+
+/// Correctness gate for the batched gather (B9): `device_gather_batched` must be
+/// bit-exact with running `device_gather` once per request — the single-gather
+/// path is the trusted reference. Covers mixed ndim and non-power-of-two dims
+/// (so it can never silently special-case the dim-2 hypercube), for both element
+/// widths (32/64-bit).
+#[cfg(all(test, feature = "cuda-tropical"))]
+mod batched_gather_tests {
+    use super::*;
+
+    fn colmajor_contig(shape: &[usize]) -> Vec<usize> {
+        let mut s = vec![0usize; shape.len()];
+        let mut acc = 1;
+        for (i, &d) in shape.iter().enumerate() {
+            s[i] = acc;
+            acc *= d;
+        }
+        s
+    }
+
+    /// `(new_shape, src_strides)` for permuting a contiguous column-major tensor
+    /// of `shape` by `perm` — same semantics `canonical_gather_args` produces.
+    fn perm_gather(shape: &[usize], perm: &[usize]) -> (Vec<usize>, Vec<usize>) {
+        let c = colmajor_contig(shape);
+        let new_shape = perm.iter().map(|&p| shape[p]).collect();
+        let src_strides = perm.iter().map(|&p| c[p]).collect();
+        (new_shape, src_strides)
+    }
+
+    // (shape, perm) cases: mixed ndim, incl. non-power-of-two extents.
+    fn cases() -> Vec<(Vec<usize>, Vec<usize>)> {
+        vec![
+            (vec![2, 2, 2, 2], vec![3, 1, 0, 2]),
+            (vec![3, 5, 2, 7], vec![2, 0, 3, 1]), // non-power-of-two
+            (vec![4, 4], vec![1, 0]),
+            (vec![2, 3, 4], vec![2, 1, 0]),
+            (vec![6], vec![0]), // ndim == 1
+        ]
+    }
+
+    #[test]
+    fn batched_gather_matches_single_u32() {
+        let cuda = Cuda::new().expect("init cuda");
+        let stream = cuda.stream.clone();
+        let cs = cases();
+        let inputs: Vec<_> = cs
+            .iter()
+            .map(|(shape, _)| {
+                let n: usize = shape.iter().product();
+                let host: Vec<u32> = (0..n as u32).collect();
+                stream.memcpy_stod(&host).expect("upload input")
+            })
+            .collect();
+        let gathers: Vec<(Vec<usize>, Vec<usize>)> =
+            cs.iter().map(|(s, p)| perm_gather(s, p)).collect();
+
+        let single: Vec<Vec<u32>> = inputs
+            .iter()
+            .zip(gathers.iter())
+            .map(|(inp, (ns, ss))| {
+                let o = cuda.device_gather::<u32>(inp, ns, ss);
+                stream.memcpy_dtov(&o).expect("dtov single")
+            })
+            .collect();
+
+        let reqs: Vec<(&_, &[usize], &[usize])> = inputs
+            .iter()
+            .zip(gathers.iter())
+            .map(|(inp, (ns, ss))| (inp, ns.as_slice(), ss.as_slice()))
+            .collect();
+        let batched = cuda.device_gather_batched::<u32>(&reqs);
+
+        assert_eq!(batched.len(), single.len());
+        for (i, (b, s)) in batched.iter().zip(single.iter()).enumerate() {
+            let bh = stream.memcpy_dtov(b).expect("dtov batched");
+            assert_eq!(&bh, s, "batched gather case {i} (u32) mismatch vs single");
+        }
+    }
+
+    #[test]
+    fn batched_gather_matches_single_u64() {
+        let cuda = Cuda::new().expect("init cuda");
+        let stream = cuda.stream.clone();
+        let cs = cases();
+        let inputs: Vec<_> = cs
+            .iter()
+            .map(|(shape, _)| {
+                let n: usize = shape.iter().product();
+                let host: Vec<u64> = (0..n as u64).collect();
+                stream.memcpy_stod(&host).expect("upload input")
+            })
+            .collect();
+        let gathers: Vec<(Vec<usize>, Vec<usize>)> =
+            cs.iter().map(|(s, p)| perm_gather(s, p)).collect();
+
+        let single: Vec<Vec<u64>> = inputs
+            .iter()
+            .zip(gathers.iter())
+            .map(|(inp, (ns, ss))| {
+                let o = cuda.device_gather::<u64>(inp, ns, ss);
+                stream.memcpy_dtov(&o).expect("dtov single")
+            })
+            .collect();
+
+        let reqs: Vec<(&_, &[usize], &[usize])> = inputs
+            .iter()
+            .zip(gathers.iter())
+            .map(|(inp, (ns, ss))| (inp, ns.as_slice(), ss.as_slice()))
+            .collect();
+        let batched = cuda.device_gather_batched::<u64>(&reqs);
+
+        assert_eq!(batched.len(), single.len());
+        for (i, (b, s)) in batched.iter().zip(single.iter()).enumerate() {
+            let bh = stream.memcpy_dtov(b).expect("dtov batched");
+            assert_eq!(&bh, s, "batched gather case {i} (u64) mismatch vs single");
+        }
     }
 }
