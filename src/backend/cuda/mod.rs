@@ -443,9 +443,13 @@ impl Cuda {
         use cudarc::driver::{LaunchConfig, PushKernelArg};
 
         let numel: usize = new_shape.iter().product();
-        let mut out = self
-            .stream
-            .alloc_zeros::<T>(numel.max(1))
+        // Uninitialized: the gather kernel writes out[o] for every o in 0..numel
+        // (grid sized via `for_num_elems(numel)`, with an `o >= numel` guard), so
+        // every element of the output is overwritten before any reader — zeroing
+        // it would be wasted work (this is the per-node gather memset that, after
+        // the batched-GEMM fix, became the dominant residual). The numel==0 guard
+        // returns the max(1) placeholder unread.
+        let mut out = unsafe { self.stream.alloc::<T>(numel.max(1)) }
             .expect("alloc device gather output");
         if numel == 0 {
             return out;
