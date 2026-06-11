@@ -662,11 +662,11 @@ impl Cuda {
             out_guards.push(og);
         }
 
-        let d_in = self.stream.memcpy_stod(&in_ptrs).expect("upload gather in ptrs");
-        let d_out = self.stream.memcpy_stod(&out_ptrs).expect("upload gather out ptrs");
-        let d_meta = self.stream.memcpy_stod(&meta).expect("upload gather meta");
-        let d_off = self.stream.memcpy_stod(&meta_off).expect("upload gather meta_off");
-        let d_prefix = self.stream.memcpy_stod(&prefix).expect("upload gather prefix");
+        let d_in = self.stream.clone_htod(&in_ptrs).expect("upload gather in ptrs");
+        let d_out = self.stream.clone_htod(&out_ptrs).expect("upload gather out ptrs");
+        let d_meta = self.stream.clone_htod(&meta).expect("upload gather meta");
+        let d_off = self.stream.clone_htod(&meta_off).expect("upload gather meta_off");
+        let d_prefix = self.stream.clone_htod(&prefix).expect("upload gather prefix");
 
         let fname = match std::mem::size_of::<T>() {
             4 => "gather_batched32",
@@ -909,20 +909,32 @@ impl Cuda {
                 // Skip the operand gather when it would copy the input verbatim
                 // (canonical layout already): one fewer launch + alloc per node.
                 let a_numel: usize = a_new_shape.iter().product();
-                let a_canon = if is_identity_gather(&a_new_shape, &a_src_strides)
-                    && a_slice.len() == a_numel
-                {
-                    None
-                } else {
-                    Some(self.device_gather::<$scalar>(a_slice, &a_new_shape, &a_src_strides))
-                };
                 let b_numel: usize = b_new_shape.iter().product();
-                let b_canon = if is_identity_gather(&b_new_shape, &b_src_strides)
-                    && b_slice.len() == b_numel
-                {
-                    None
-                } else {
-                    Some(self.device_gather::<$scalar>(b_slice, &b_new_shape, &b_src_strides))
+                let a_id = is_identity_gather(&a_new_shape, &a_src_strides) && a_slice.len() == a_numel;
+                let b_id = is_identity_gather(&b_new_shape, &b_src_strides) && b_slice.len() == b_numel;
+                // When BOTH operands need a real gather, do them in one launch
+                // (the per-node A+B pair is the bulk of the gather launches that
+                // make this regime launch-bound); otherwise gather the single
+                // non-identity operand directly (no batching overhead).
+                let (a_canon, b_canon) = match (a_id, b_id) {
+                    (true, true) => (None, None),
+                    (false, true) => (
+                        Some(self.device_gather::<$scalar>(a_slice, &a_new_shape, &a_src_strides)),
+                        None,
+                    ),
+                    (true, false) => (
+                        None,
+                        Some(self.device_gather::<$scalar>(b_slice, &b_new_shape, &b_src_strides)),
+                    ),
+                    (false, false) => {
+                        let mut outs = self.device_gather_batched::<$scalar>(&[
+                            (a_slice, a_new_shape.as_slice(), a_src_strides.as_slice()),
+                            (b_slice, b_new_shape.as_slice(), b_src_strides.as_slice()),
+                        ]);
+                        let b_out = outs.pop().unwrap();
+                        let a_out = outs.pop().unwrap();
+                        (Some(a_out), Some(b_out))
+                    }
                 };
                 let c_canon = batched_tropical_gemm_dev::<$kernel>(
                     &tctx,
@@ -2104,7 +2116,7 @@ mod batched_gather_tests {
             .map(|(shape, _)| {
                 let n: usize = shape.iter().product();
                 let host: Vec<u32> = (0..n as u32).collect();
-                stream.memcpy_stod(&host).expect("upload input")
+                stream.clone_htod(&host).expect("upload input")
             })
             .collect();
         let gathers: Vec<(Vec<usize>, Vec<usize>)> =
@@ -2115,7 +2127,7 @@ mod batched_gather_tests {
             .zip(gathers.iter())
             .map(|(inp, (ns, ss))| {
                 let o = cuda.device_gather::<u32>(inp, ns, ss);
-                stream.memcpy_dtov(&o).expect("dtov single")
+                stream.clone_dtoh(&o).expect("dtov single")
             })
             .collect();
 
@@ -2128,7 +2140,7 @@ mod batched_gather_tests {
 
         assert_eq!(batched.len(), single.len());
         for (i, (b, s)) in batched.iter().zip(single.iter()).enumerate() {
-            let bh = stream.memcpy_dtov(b).expect("dtov batched");
+            let bh = stream.clone_dtoh(b).expect("dtov batched");
             assert_eq!(&bh, s, "batched gather case {i} (u32) mismatch vs single");
         }
     }
@@ -2143,7 +2155,7 @@ mod batched_gather_tests {
             .map(|(shape, _)| {
                 let n: usize = shape.iter().product();
                 let host: Vec<u64> = (0..n as u64).collect();
-                stream.memcpy_stod(&host).expect("upload input")
+                stream.clone_htod(&host).expect("upload input")
             })
             .collect();
         let gathers: Vec<(Vec<usize>, Vec<usize>)> =
@@ -2154,7 +2166,7 @@ mod batched_gather_tests {
             .zip(gathers.iter())
             .map(|(inp, (ns, ss))| {
                 let o = cuda.device_gather::<u64>(inp, ns, ss);
-                stream.memcpy_dtov(&o).expect("dtov single")
+                stream.clone_dtoh(&o).expect("dtov single")
             })
             .collect();
 
@@ -2167,7 +2179,7 @@ mod batched_gather_tests {
 
         assert_eq!(batched.len(), single.len());
         for (i, (b, s)) in batched.iter().zip(single.iter()).enumerate() {
-            let bh = stream.memcpy_dtov(b).expect("dtov batched");
+            let bh = stream.clone_dtoh(b).expect("dtov batched");
             assert_eq!(&bh, s, "batched gather case {i} (u64) mismatch vs single");
         }
     }
