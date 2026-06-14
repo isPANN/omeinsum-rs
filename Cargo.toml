@@ -33,18 +33,20 @@ omeco = "0.2.4"
 # (otherwise `TropicalMaxPlus<f32>` from crates.io is a distinct, incompatible
 # type). The root API used by the CPU path is identical across the two sources.
 #
-# Branch `perf/forward-batched-gemm` = `perf/cuda-async-launch` (= `main` + the
-# async-launch fix, TensorBFS PR #60) + the forward strided-batched tropical GEMM
-# kernel (`CudaKernel::launch_gemm_batched`), which the CUDA device path below
-# uses to run a whole contraction node's batch in one launch. Repin down to
-# `perf/cuda-async-launch` / `main` as those merge upstream.
-tropical-gemm = { git = "https://github.com/TensorBFS/tropical-gemm", branch = "perf/forward-batched-gemm", optional = true }
+# Pinned to `main`, which now carries the forward strided-batched tropical GEMM
+# kernel (`CudaKernel::launch_gemm_batched`, TensorBFS PR #62) — the CUDA device
+# path below uses it to run a whole contraction node's batch in one launch — plus
+# the gridDim.z 65535 batch-chunking + i32-stride-overflow guard that keeps that
+# launch from crashing with CUDA_ERROR_INVALID_VALUE once a node's batch exceeds
+# 65535 (large-region GPU contractions). Cargo.lock locks the exact main commit.
+tropical-gemm = { git = "https://github.com/TensorBFS/tropical-gemm", branch = "main", optional = true }
 
 # Optional: CUDA support
-# tropical-gemm-cuda pinned to the same branch (column-major host API +
+# tropical-gemm-cuda pinned to the same `main` (column-major host API +
 # device-resident from_cuda_slice / CudaContext::from_device not yet on crates.io
-# 0.2.0, plus the async-launch fix and the forward batched kernel). See above.
-tropical-gemm-cuda = { git = "https://github.com/TensorBFS/tropical-gemm", branch = "perf/forward-batched-gemm", optional = true }
+# 0.2.0, plus the async-launch fix, the forward batched kernel, and the batch
+# gridDim.z chunking + i32-stride guard). See above.
+tropical-gemm-cuda = { git = "https://github.com/TensorBFS/tropical-gemm", branch = "main", optional = true }
 # cudarc 0.19.x is required to share a device zero-copy with tropical-gemm-cuda
 # (pre-1.0 semver: the exact minor must match the dep's). Feature set mirrors the
 # dep so cargo unifies them into a single build.
