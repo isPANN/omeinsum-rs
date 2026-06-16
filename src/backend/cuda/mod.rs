@@ -373,6 +373,26 @@ extern "C" __global__ void gather_batched64(unsigned long long* out_ptrs,
 }
 "#;
 
+/// 1-D launch config for the elementwise gather kernels, sized for `numel`
+/// output elements with cudarc's `for_num_elems` layout (block = 1024) but the
+/// grid computed in 64-bit. `numel` is a `usize` and can exceed `u32::MAX` (a
+/// 2^32-element gather occurs at sc-target 32); `numel as u32` would wrap — at
+/// exactly 2^32 to 0, yielding a zero grid and `CUDA_ERROR_INVALID_VALUE`. The
+/// gather kernels index globally in `long long`, so a wide grid is safe. The
+/// grid is clamped to at least 1 block. Fails only past the physically
+/// impossible ~2^41 elements (grid x-dim > u32::MAX).
+#[cfg(feature = "cuda-tropical")]
+fn gather_launch_config(numel: usize) -> cudarc::driver::LaunchConfig {
+    const NUM_THREADS: u32 = 1024;
+    let num_blocks = u32::try_from((numel as u64).div_ceil(NUM_THREADS as u64).max(1))
+        .expect("gather grid dimension exceeds u32::MAX");
+    cudarc::driver::LaunchConfig {
+        grid_dim: (num_blocks, 1, 1),
+        block_dim: (NUM_THREADS, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
 // SAFETY: Cuda is Send because all fields are Send.
 // The Mutex ensures safe concurrent access to handle and cache.
 unsafe impl Send for Cuda {}
@@ -523,7 +543,7 @@ impl Cuda {
     where
         T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default + Clone,
     {
-        use cudarc::driver::{LaunchConfig, PushKernelArg};
+        use cudarc::driver::PushKernelArg;
 
         let numel: usize = new_shape.iter().product();
         // Diagnostic only (env-gated, zero cost when off): record the executed
@@ -556,7 +576,11 @@ impl Cuda {
             other => panic!("device_gather: unsupported element width {other} bytes"),
         };
         let func = self.permute_function(fname);
-        let cfg = LaunchConfig::for_num_elems(numel as u32);
+        // `numel` can exceed u32::MAX: a 2^32-element gather (sc-target 32) would
+        // make `numel as u32` wrap to 0 -> grid dim 0 -> CUDA_ERROR_INVALID_VALUE.
+        // Compute the 1-D grid in 64-bit (the kernel already does 64-bit global
+        // indexing, see gather32/64), matching cudarc's block=1024 layout.
+        let cfg = gather_launch_config(numel);
 
         // Reuse per-ndim metadata buffers: allocate one (shape, strides) pair per
         // distinct rank on first use, then re-upload into them with `memcpy_htod`
@@ -619,7 +643,7 @@ impl Cuda {
     where
         T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default + Clone,
     {
-        use cudarc::driver::{DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg};
+        use cudarc::driver::{DevicePtr, DevicePtrMut, PushKernelArg};
 
         let k = reqs.len();
         let numels: Vec<usize> = reqs.iter().map(|(_, sh, _)| sh.iter().product()).collect();
@@ -680,7 +704,10 @@ impl Cuda {
             other => panic!("device_gather_batched: unsupported element width {other} bytes"),
         };
         let func = self.permute_function(fname);
-        let cfg = LaunchConfig::for_num_elems(total as u32);
+        // See `gather_launch_config`: `total` can exceed u32::MAX at large scale,
+        // and `total as u32` would wrap (the batched kernel grid-stride-loops, so
+        // it only needs a non-zero grid, but compute it in 64-bit regardless).
+        let cfg = gather_launch_config(total as usize);
         let k_i32 = k as i32;
         let mut builder = self.stream.launch_builder(&func);
         builder
