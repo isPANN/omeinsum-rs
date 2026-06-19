@@ -8,7 +8,7 @@ BENCH_WARMUP ?= 5
 BENCH_DIM ?= 128
 BENCH_BATCH ?= 24
 
-.PHONY: all build build-debug cargo-check check test test-gpu test-release bench bench-binary bench-network bench-cpu-contract bench-julia bench-compare docs clean help
+.PHONY: all build build-debug cargo-check check test test-gpu test-gpu-tropical test-release bench bench-binary bench-network bench-cpu-contract bench-julia bench-compare docs clean help
 .PHONY: setup setup-rust
 .PHONY: docs-build docs-serve docs-book docs-book-serve
 .PHONY: fmt fmt-check clippy lint coverage
@@ -41,7 +41,8 @@ help:
 	@echo ""
 	@echo "Test targets:"
 	@echo "  test           - Run tests with non-GPU features (tropical, parallel)"
-	@echo "  test-gpu       - Run tests with all features including CUDA"
+	@echo "  test-gpu       - Run tests with all features (cuTENSOR + tropical GPU; needs libcutensor)"
+	@echo "  test-gpu-tropical - Run tropical GPU tests via tropical-gemm-cuda (no cuTENSOR needed)"
 	@echo "  test-release   - Run tests in release mode (non-GPU features)"
 	@echo ""
 	@echo "Benchmark targets:"
@@ -125,8 +126,14 @@ test:
 	@echo "Tests complete."
 
 test-gpu:
-	@echo "Running tests with all features (including CUDA)..."
-	cargo test --features "tropical parallel cuda"
+	@echo "Running tests with all features (cuTENSOR + tropical GPU)..."
+	@echo "  (requires libcutensor 2.0+; use test-gpu-tropical on hosts without it)"
+	cargo test --features "tropical parallel cuda cuda-tropical"
+	@echo "Tests complete."
+
+test-gpu-tropical:
+	@echo "Running tropical GPU tests via tropical-gemm-cuda (no cuTENSOR needed)..."
+	cargo test --features "tropical parallel cuda-tropical"
 	@echo "Tests complete."
 
 test-release:

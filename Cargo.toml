@@ -26,12 +26,31 @@ faer = "0.24"
 # Contraction order optimization
 omeco = "0.2.4"
 
-# Optional: Tropical algebra support (v0.2+ for column-major)
-tropical-gemm = { version = "0.2", optional = true }
+# Optional: Tropical algebra support (v0.2+ for column-major).
+# Pinned to the same git branch as `tropical-gemm-cuda` below: the CUDA kernels'
+# `CudaKernel` trait is implemented for that workspace's semiring types, so the
+# CPU and GPU tropical paths must share a single `tropical-gemm` crate instance
+# (otherwise `TropicalMaxPlus<f32>` from crates.io is a distinct, incompatible
+# type). The root API used by the CPU path is identical across the two sources.
+#
+# Pinned to `main`, which now carries the forward strided-batched tropical GEMM
+# kernel (`CudaKernel::launch_gemm_batched`, TensorBFS PR #62) — the CUDA device
+# path below uses it to run a whole contraction node's batch in one launch — plus
+# the gridDim.z 65535 batch-chunking + i32-stride-overflow guard that keeps that
+# launch from crashing with CUDA_ERROR_INVALID_VALUE once a node's batch exceeds
+# 65535 (large-region GPU contractions). Cargo.lock locks the exact main commit.
+tropical-gemm = { git = "https://github.com/TensorBFS/tropical-gemm", branch = "main", optional = true }
 
 # Optional: CUDA support
-tropical-gemm-cuda = { version = "0.2", optional = true }
-cudarc = { version = "0.12", features = ["cuda-version-from-build-system"], optional = true }
+# tropical-gemm-cuda pinned to the same `main` (column-major host API +
+# device-resident from_cuda_slice / CudaContext::from_device not yet on crates.io
+# 0.2.0, plus the async-launch fix, the forward batched kernel, and the batch
+# gridDim.z chunking + i32-stride guard). See above.
+tropical-gemm-cuda = { git = "https://github.com/TensorBFS/tropical-gemm", branch = "main", optional = true }
+# cudarc 0.19.x is required to share a device zero-copy with tropical-gemm-cuda
+# (pre-1.0 semver: the exact minor must match the dep's). Feature set mirrors the
+# dep so cargo unifies them into a single build.
+cudarc = { version = "0.19.7", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-version-from-build-system", "fallback-latest"], optional = true }
 
 # Optional: Parallelism
 rayon = { version = "1.8", optional = true }
@@ -56,11 +75,17 @@ tropical-kernels = ["tropical"]
 # Parallel execution
 parallel = ["rayon"]
 
-# CUDA backend (requires cuTENSOR 2.0+, see package.metadata.native-deps)
+# CUDA backend for standard algebra via cuTENSOR (requires cuTENSOR 2.0+, see
+# package.metadata.native-deps).
 cuda = ["dep:cudarc"]
 
+# Tropical contractions on GPU via tropical-gemm-cuda. Independent of cuTENSOR:
+# brings the cudarc device/storage layer + the tropical GPU kernels, so it builds
+# and runs without libcutensor present.
+cuda-tropical = ["dep:cudarc", "tropical", "dep:tropical-gemm-cuda"]
+
 # Convenience: all features
-full = ["tropical", "cuda"]
+full = ["tropical", "cuda", "cuda-tropical"]
 
 [[example]]
 name = "basic_einsum"
@@ -71,6 +96,11 @@ required-features = ["tropical"]
 name = "tropical_network"
 path = "examples/tropical_network.rs"
 required-features = ["tropical"]
+
+[[example]]
+name = "tropical_network_gpu"
+path = "examples/tropical_network_gpu.rs"
+required-features = ["cuda-tropical"]
 
 [workspace]
 members = [".", "omeinsum-cli"]
