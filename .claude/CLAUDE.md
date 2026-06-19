@@ -26,6 +26,26 @@ cargo test --features tropical
 
 `make check` is the canonical pre-PR gate. It runs formatting, clippy, and the non-GPU test suite.
 
+## Releasing
+
+Releases are cut with the `make release` target and published to crates.io by CI:
+
+```bash
+make release V=x.y.z
+```
+
+This bumps `version` in `Cargo.toml` + `omeinsum-cli/Cargo.toml`, runs `cargo check`,
+commits `release: vx.y.z`, tags `vx.y.z`, pushes `main` + the tag, and creates a
+GitHub release with generated notes. Guards: must run from `main`, requires a clean
+worktree, and aborts if the tag already exists. (`Cargo.lock` is gitignored, so it is
+only added when tracked.)
+
+Publishing is automated: the GitHub *release published* event triggers
+`.github/workflows/release.yml`, which runs `cargo publish` with the
+`CARGO_REGISTRY_TOKEN` secret. `workflow_dispatch` supports a `dry_run` input
+(`cargo publish --dry-run`). The `release` repo-local skill wraps this flow with a
+pre-release hygiene gate.
+
 ## CLI (`omeinsum`)
 
 Install with `make cli`. Three subcommands:
