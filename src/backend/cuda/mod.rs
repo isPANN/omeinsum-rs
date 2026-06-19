@@ -556,8 +556,8 @@ impl Cuda {
         // it would be wasted work (this is the per-node gather memset that, after
         // the batched-GEMM fix, became the dominant residual). The numel==0 guard
         // returns the max(1) placeholder unread.
-        let mut out = unsafe { self.stream.alloc::<T>(numel.max(1)) }
-            .expect("alloc device gather output");
+        let mut out =
+            unsafe { self.stream.alloc::<T>(numel.max(1)) }.expect("alloc device gather output");
         if numel == 0 {
             return out;
         }
@@ -692,11 +692,23 @@ impl Cuda {
             out_guards.push(og);
         }
 
-        let d_in = self.stream.clone_htod(&in_ptrs).expect("upload gather in ptrs");
-        let d_out = self.stream.clone_htod(&out_ptrs).expect("upload gather out ptrs");
+        let d_in = self
+            .stream
+            .clone_htod(&in_ptrs)
+            .expect("upload gather in ptrs");
+        let d_out = self
+            .stream
+            .clone_htod(&out_ptrs)
+            .expect("upload gather out ptrs");
         let d_meta = self.stream.clone_htod(&meta).expect("upload gather meta");
-        let d_off = self.stream.clone_htod(&meta_off).expect("upload gather meta_off");
-        let d_prefix = self.stream.clone_htod(&prefix).expect("upload gather prefix");
+        let d_off = self
+            .stream
+            .clone_htod(&meta_off)
+            .expect("upload gather meta_off");
+        let d_prefix = self
+            .stream
+            .clone_htod(&prefix)
+            .expect("upload gather prefix");
 
         let fname = match std::mem::size_of::<T>() {
             4 => "gather_batched32",
@@ -1372,7 +1384,10 @@ fn record_gather_stat(new_shape: &[usize], src_strides: &[usize], numel: usize) 
             .collect();
         lines.sort();
         let total_calls = g.1;
-        let header = format!("# total_gather_calls={total_calls} unique_patterns={}", g.0.len());
+        let header = format!(
+            "# total_gather_calls={total_calls} unique_patterns={}",
+            g.0.len()
+        );
         let _ = std::fs::write(&path, format!("{header}\n{}\n", lines.join("\n")));
     }
 }
